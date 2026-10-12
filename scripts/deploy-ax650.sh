@@ -2,8 +2,8 @@
 set -euo pipefail
 
 SDK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TARGET="${TARGET:-root@10.126.29.50}"
-TARGET_DIR="${TARGET_DIR:-/root/wangzizhen/asr-chain}"
+TARGET="${TARGET:-root@192.168.1.20}"
+TARGET_DIR="${TARGET_DIR:-/opt/ax-audio-sdk}"
 SSH_PASSWORD="${SSH_PASSWORD:-}"
 
 ssh_command=(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10)
@@ -23,6 +23,7 @@ deploy_items=(
     build/libfastenhance.so
     build/qwen3-worker
     build/hojo-tts-resident
+    build/diar-worker
     config/sdk-config.yaml
     config/default-config.yaml
     scripts/run-target.sh
@@ -41,7 +42,20 @@ deploy_items=(
     driver/asr/sensevoice/lib/libax_asr_api.so
     models-for-asr-chain/ns/fastenhance/fastenhance_48k.axmodel
     models-for-asr-chain/vad/ten-vad/ten-vad.axmodel
-    models-for-asr-chain/campplus/campplus.axmodel
+    models-for-asr-chain/pyannote/segmentation_sincnet.axmodel
+    models-for-asr-chain/pyannote/segmentation_convs1.axmodel
+    models-for-asr-chain/pyannote/segmentation_convs2.axmodel
+    models-for-asr-chain/pyannote/embedding_convs.axmodel
+    models-for-asr-chain/pyannote/lstm_cell_l0.axmodel
+    models-for-asr-chain/pyannote/lstm_cell_l1.axmodel
+    models-for-asr-chain/pyannote/lstm_cell_l2.axmodel
+    models-for-asr-chain/pyannote/lstm_cell_l3.axmodel
+    models-for-asr-chain/pyannote/fbank.bin
+    models-for-asr-chain/pyannote/frontend.bin
+    models-for-asr-chain/pyannote/ffn.bin
+    models-for-asr-chain/pyannote/powerset.bin
+    models-for-asr-chain/pyannote/embtail.bin
+    models-for-asr-chain/pyannote/plda.bin
     models-for-asr-chain/llm/qwen3-1.7b/config.json
     models-for-asr-chain/llm/qwen3-1.7b/post_config.json
     models-for-asr-chain/llm/qwen3-1.7b/qwen3_tokenizer.txt
@@ -179,7 +193,7 @@ echo "Incremental deploy: ${unchanged_count} unchanged, ${#changed_items[@]} upl
       models-for-asr-chain/tts/hojo/models/Hojo-TTS-Light-40M-voice.npz \
       models-for-asr-chain/asr/sensevoice/streaming_sensevoice.axmodel && \
     chmod +x build/run-alsa-apm build/audio-pipeline build/qwen3-worker \
-      build/hojo-tts-resident scripts/check-target-deps.sh \
+      build/hojo-tts-resident build/diar-worker scripts/check-target-deps.sh \
       scripts/run-target.sh scripts/clean-history.sh \
       scripts/start-ui.sh && \
     chmod 444 config/default-config.yaml && \

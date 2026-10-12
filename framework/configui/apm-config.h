@@ -96,19 +96,33 @@ struct AppConfig {
     float trailing_silence_seconds = 3.0f;
   } vad;
 
-  struct Campplus {
+  struct Diarization {
     bool enabled = false;
     bool logging_enabled = false;
-    // AX650 NPU1 CAMPPlus model.  The deployed image may override this path.
-    std::string model_path = "models-for-asr-chain/campplus/campplus.axmodel";
+    // "segment": run the resident worker per VAD segment (lowest latency).
+    // "session": for file inputs, diarize the whole source once at startup and
+    // map the resulting speaker timeline onto VAD segments (best quality).
+    std::string mode = "segment";
+    // Resident pyannote community-1 worker; the model directory must contain
+    // the eight axmodels plus fbank/frontend/ffn/powerset/embtail/plda bin
+    // host assets.
+    std::string runner = "build/diar-worker";
+    std::string model_path = "models-for-asr-chain/pyannote";
     std::string speaker_table_path = "/tmp/ax-audio-sdk/speakers.json";
-    // Embeddings are produced for a 1.5 s window every 0.75 s.
-    int min_cluster_size = 4;
-    float merge_cosine = 0.8f;
-    int min_num_speakers = 1;
-    int max_num_speakers = 15;
-    float speaker_match_threshold = 0.65f;
-  } campplus;
+    // Cosine threshold for matching 256-D community-1 centroids against the
+    // persistent speaker table.
+    float speaker_match_threshold = 0.55f;
+    // Segmentation sliding stride; the window duration is 10 s.
+    float step_sec = 2.0f;
+    // OpenMP threads used by the host-side FP32 stages.
+    int omp_threads = 4;
+    // Streaming session mode: chunk length sent to the resident worker for
+    // realtime inputs (ALSA, or file input in realtime emulation mode).
+    float session_chunk_sec = 120.0f;
+    // How long a segment may wait for the session timeline to cover it before
+    // falling back to per-segment diarization (0 = never wait).
+    float session_max_wait_sec = 180.0f;
+  } diarization;
 
   struct Asr {
     bool enabled = true;

@@ -45,41 +45,16 @@ ALSA_LIBRARY="${ALSA_LIBRARY:-}"
 mkdir -p "${BUILD_DIR}"
 
 AX650_SDK_ROOT="${AX650_SDK_ROOT:-}"
-CAMPPLUS_SRC="${SDK_DIR}/driver/campplus"
-CAMPPLUS_EXTRA=()
-CAMPPLUS_LIBS=()
-if [[ -d "${AX650_SDK_ROOT}/include" && -d "${AX650_SDK_ROOT}/lib" ]]; then
-    # Build the small static fbank dependency once in the normal build tree.
-    # The two archives are vendored under driver/campplus/third_party, so a
-    # board build does not require network access.
-    KNF_ROOT="${BUILD_DIR}/campplus-third_party"
-    if [[ ! -f "${KNF_ROOT}/kaldi-native-fbank-1.22.3/CMakeLists.txt" ]]; then
-        mkdir -p "${KNF_ROOT}"
-        tar -xzf "${CAMPPLUS_SRC}/third_party/kaldi-native-fbank-1.22.3.tar.gz" -C "${KNF_ROOT}"
-        cp "${CAMPPLUS_SRC}/third_party/kissfft-febd4caeed32e33ad8b2e0bb5ea77542c40f18ec.zip" "${KNF_ROOT}/"
-    fi
-    cmake -S "${KNF_ROOT}/kaldi-native-fbank-1.22.3" -B "${BUILD_DIR}/campplus-knf" \
-        -DCMAKE_CXX_COMPILER="${CXX}" -DCMAKE_C_COMPILER="${CC}" \
-        "${CMAKE_SYSROOT_ARGS[@]}" \
-        -DBUILD_SHARED_LIBS=OFF -DKALDI_NATIVE_FBANK_BUILD_TESTS=OFF \
-        -DKALDI_NATIVE_FBANK_BUILD_PYTHON=OFF -DKALDI_NATIVE_FBANK_ENABLE_CHECK=OFF >/dev/null
-    cmake --build "${BUILD_DIR}/campplus-knf" --target kaldi-native-fbank-core -j2
-    CAMPPLUS_EXTRA+=("-DCAMPPLUS_AVAILABLE=1" "-I${CAMPPLUS_SRC}/include" "-I${KNF_ROOT}/kaldi-native-fbank-1.22.3" "-I${AX650_SDK_ROOT}/include")
-    CAMPPLUS_LIBS+=("${BUILD_DIR}/campplus-knf/lib/libkaldi-native-fbank-core.a" "${BUILD_DIR}/campplus-knf/lib/libkissfft-float.a" "-L${AX650_SDK_ROOT}/lib" "-lax_sys" "-lax_engine" "-lax_interpreter")
-else
-    CAMPPLUS_EXTRA+=("-I${CAMPPLUS_SRC}/include")
-fi
 
 # Native C++ runtime for the target board.  It parses sdk-config.yaml and
 # owns the complete audio/VAD/ASR/MP3 pipeline; Python is only used by the
 # optional Gradio configuration pages.
 "${CXX}" "${CROSS_FLAGS[@]}" -std=c++17 -O2 \
     -I"${SDK_DIR}/framework" -I"${SDK_DIR}/framework/configui" \
-    -I"${SDK_DIR}/driver/ns/include" -I"${SDK_DIR}/driver/vad/include" -I"${SDK_DIR}/driver/asr/sensevoice/include" "${CAMPPLUS_EXTRA[@]}" \
+    -I"${SDK_DIR}/driver/ns/include" -I"${SDK_DIR}/driver/vad/include" -I"${SDK_DIR}/driver/asr/sensevoice/include" \
     "${SDK_DIR}/framework/audio_pipeline.cpp" \
-    "${CAMPPLUS_SRC}/src/campplus.cpp" \
     "${SDK_DIR}/framework/configui/apm-config.cpp" \
-    "${CAMPPLUS_LIBS[@]}" -ldl -pthread -Wl,--export-dynamic -Wl,--allow-shlib-undefined \
+    -ldl -pthread -Wl,--export-dynamic -Wl,--allow-shlib-undefined \
     -o "${BUILD_DIR}/audio-pipeline"
 echo "Build done: ${BUILD_DIR}/audio-pipeline"
 
@@ -125,6 +100,28 @@ else
 fi
 
 if [[ -d "${AX650_SDK_ROOT}/include" && -d "${AX650_SDK_ROOT}/lib" ]]; then
+    # Speaker diarization runs as a persistent worker; the eight axmodels are
+    # loaded once at pipeline start.  The vendored engine (MIT) lives under
+    # driver/pyannote and is serialized with the NPU2 Cell lock at runtime.
+    DIAR_DIR="${SDK_DIR}/driver/pyannote"
+    "${CC}" "${CROSS_FLAGS[@]}" -O2 \
+        -c "${DIAR_DIR}/third_party/kissfft/kiss_fft.c" \
+        -o "${BUILD_DIR}/diar-kiss_fft.o"
+    "${CC}" "${CROSS_FLAGS[@]}" -O2 \
+        -c "${DIAR_DIR}/third_party/kissfft/kiss_fftr.c" \
+        -o "${BUILD_DIR}/diar-kiss_fftr.o"
+    "${CXX}" "${CROSS_FLAGS[@]}" -std=c++17 -O2 -fopenmp -DAX650 \
+        -I"${DIAR_DIR}/src" -I"${DIAR_DIR}/third_party/kissfft" \
+        -I"${AX650_SDK_ROOT}/include" \
+        "${DIAR_DIR}/src/diar_worker.cpp" \
+        "${DIAR_DIR}/src/diar_engine.cpp" \
+        "${DIAR_DIR}/src/EngineWrapper_axera.cpp" \
+        "${DIAR_DIR}/src/speaker_table.cpp" \
+        "${BUILD_DIR}/diar-kiss_fft.o" "${BUILD_DIR}/diar-kiss_fftr.o" \
+        -L"${AX650_SDK_ROOT}/lib" -lax_sys -lax_engine -lax_interpreter -pthread \
+        -o "${BUILD_DIR}/diar-worker"
+    echo "Build done: ${BUILD_DIR}/diar-worker"
+
     AX650_SDK_ROOT="${AX650_SDK_ROOT}" CROSS_SYSROOT="${CROSS_SYSROOT}" CXX="${CXX}" \
         "${SDK_DIR}/driver/ns/build-fastenhance.sh"
 

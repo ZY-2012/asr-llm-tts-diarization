@@ -111,13 +111,14 @@ def _controls_from_config(config: dict[str, Any]) -> tuple[Any, ...]:
         _value(config, "vad", "min_segment_seconds", default=3),
         _value(config, "vad", "max_segment_seconds", default=30),
         _value(config, "vad", "trailing_silence_seconds", default=3),
-        _value(config, "campplus", "enabled", default=False),
-        _value(config, "campplus", "logging_enabled", default=False),
-        _value(config, "campplus", "model_path", default="models-for-asr-chain/campplus/campplus.axmodel"),
-        _value(config, "campplus", "speaker_table_path", default="/tmp/ax-audio-sdk/speakers.json"),
-        _value(config, "campplus", "min_cluster_size", default=4),
-        _value(config, "campplus", "merge_cosine", default=0.8),
-        _value(config, "campplus", "speaker_match_threshold", default=0.65),
+        _value(config, "diarization", "enabled", default=False),
+        _value(config, "diarization", "logging_enabled", default=False),
+        _value(config, "diarization", "runner", default="build/diar-worker"),
+        _value(config, "diarization", "model_path", default="models-for-asr-chain/pyannote"),
+        _value(config, "diarization", "speaker_table_path", default="/tmp/ax-audio-sdk/speakers.json"),
+        _value(config, "diarization", "speaker_match_threshold", default=0.55),
+        _value(config, "diarization", "step_sec", default=2.0),
+        _value(config, "diarization", "omp_threads", default=4),
         _value(config, "asr", "enabled", default=True),
         _value(config, "asr", "library", default="driver/asr/sensevoice/lib/libax_asr_api.so"),
         _value(config, "asr", "model_path", default="models-for-asr-chain/asr/sensevoice"),
@@ -165,6 +166,9 @@ def _controls_from_config(config: dict[str, Any]) -> tuple[Any, ...]:
         _value(config, "runtime", "input", default="alsa"),
         _value(config, "runtime", "input_wav", default=""),
         _value(config, "runtime", "file_input_mode", default="realtime"),
+        _value(config, "diarization", "mode", default="segment"),
+        _value(config, "diarization", "session_chunk_sec", default=120.0),
+        _value(config, "diarization", "session_max_wait_sec", default=180.0),
     )
 
 
@@ -211,7 +215,7 @@ link.title = `打开 ${{target.toString()}}`;
 def build_ui(config_path: Path, apm_port: int = 7861) -> gr.Blocks:
     initial = _read(str(config_path))
     with gr.Blocks(title="AX650 音频 SDK 配置") as app:
-        gr.Markdown("# AX650 音频处理链配置\nALSA → WebRTC APM → FastEnhance → 低通/16 kHz → TEN-VAD → CampPlus（可选）→ SenseVoice → Qwen3（可选）→ Hojo TTS（可选）")
+        gr.Markdown("# AX650 音频处理链配置\nALSA → WebRTC APM → FastEnhance → 低通/16 kHz → TEN-VAD → 说话人分离（可选）→ SenseVoice → Qwen3（可选）→ Hojo TTS（可选）")
         path = gr.Textbox(label="统一配置文件", value=str(config_path.resolve()))
         with gr.Tab("ALSA 输入/监听"):
             input_source = gr.Radio(
@@ -255,15 +259,25 @@ def build_ui(config_path: Path, apm_port: int = 7861) -> gr.Blocks:
                 min_segment = gr.Number(label="最短累积 (s)", value=_value(initial, "vad", "min_segment_seconds", default=3))
                 max_segment = gr.Number(label="最长累积兜底 (s)", value=_value(initial, "vad", "max_segment_seconds", default=30))
                 trailing = gr.Number(label="末尾静音触发 (s)", value=_value(initial, "vad", "trailing_silence_seconds", default=3))
-        with gr.Tab("CampPlus 说话人"):
-            campplus_enabled = gr.Checkbox(label="启用 CampPlus 说话人识别", value=_value(initial, "campplus", "enabled", default=False))
-            campplus_logging = gr.Checkbox(label="输出 CampPlus 聚类详细日志", value=_value(initial, "campplus", "logging_enabled", default=False))
-            campplus_model = gr.Textbox(label="CampPlus AX650 模型", value=_value(initial, "campplus", "model_path", default="models-for-asr-chain/campplus/campplus.axmodel"))
-            speaker_table = gr.Textbox(label="长期说话人库（JSON）", value=_value(initial, "campplus", "speaker_table_path", default="/tmp/ax-audio-sdk/speakers.json"))
+        with gr.Tab("说话人分离 (pyannote)"):
+            diarization_enabled = gr.Checkbox(label="启用 pyannote 说话人分离", value=_value(initial, "diarization", "enabled", default=False))
+            diarization_logging = gr.Checkbox(label="输出说话人匹配详细日志", value=_value(initial, "diarization", "logging_enabled", default=False))
+            diarization_runner = gr.Textbox(label="常驻 Worker", value=_value(initial, "diarization", "runner", default="build/diar-worker"))
+            diarization_model = gr.Textbox(label="pyannote 模型目录", value=_value(initial, "diarization", "model_path", default="models-for-asr-chain/pyannote"))
+            speaker_table = gr.Textbox(label="长期说话人库（JSON）", value=_value(initial, "diarization", "speaker_table_path", default="/tmp/ax-audio-sdk/speakers.json"))
+            speaker_match = gr.Slider(-1, 1, step=0.01, label="历史说话人匹配阈值", value=_value(initial, "diarization", "speaker_match_threshold", default=0.55))
             with gr.Row():
-                min_cluster_size = gr.Number(label="小簇合并/过滤阈值（样本数）", value=_value(initial, "campplus", "min_cluster_size", default=4), precision=0)
-                merge_cosine = gr.Slider(-1, 1, step=0.01, label="相似簇合并阈值", value=_value(initial, "campplus", "merge_cosine", default=0.8))
-                speaker_match = gr.Slider(-1, 1, step=0.01, label="历史说话人匹配阈值", value=_value(initial, "campplus", "speaker_match_threshold", default=0.65))
+                diarization_step = gr.Number(label="分割滑动步长（s）", value=_value(initial, "diarization", "step_sec", default=2.0))
+                diarization_threads = gr.Number(label="OpenMP 线程数", value=_value(initial, "diarization", "omp_threads", default=4), precision=0)
+            diarization_mode = gr.Dropdown(
+                label="分离模式",
+                choices=["segment", "session"],
+                value=_value(initial, "diarization", "mode", default="segment"),
+                info="segment=每个 VAD 话段独立分离（低延迟）；session=文件批量启动时整段分离并映射到各话段；实时输入按分块会话级处理。",
+            )
+            with gr.Row():
+                diarization_chunk = gr.Number(label="流式分块长度（s）", value=_value(initial, "diarization", "session_chunk_sec", default=120.0))
+                diarization_wait = gr.Number(label="标签最长等待（s，0=立即回退）", value=_value(initial, "diarization", "session_max_wait_sec", default=180.0))
         with gr.Tab("SenseVoice / 输出"):
             sensevoice_enabled = gr.Checkbox(label="启用 SenseVoice", value=_value(initial, "asr", "enabled", default=True))
             sensevoice_library = gr.Textbox(label="SenseVoice 动态库", value=_value(initial, "asr", "library", default="driver/asr/sensevoice/lib/libax_asr_api.so"))
@@ -366,7 +380,7 @@ def build_ui(config_path: Path, apm_port: int = 7861) -> gr.Blocks:
                     enhance_enabled, enhance_model, enhance_library,
                     enhance_core,
                     vad_enabled, vad_library, vad_model, vad_threshold, min_speech, min_segment, max_segment, trailing,
-                    campplus_enabled, campplus_logging, campplus_model, speaker_table, min_cluster_size, merge_cosine, speaker_match,
+                    diarization_enabled, diarization_logging, diarization_runner, diarization_model, speaker_table, speaker_match, diarization_step, diarization_threads,
                     sensevoice_enabled, sensevoice_library, sensevoice_model, sensevoice_type, language,
                     text_file, temp_dir, mp3_dir, storage,
                     llm_enabled, llm_model, llm_runner, llm_system,
@@ -379,7 +393,8 @@ def build_ui(config_path: Path, apm_port: int = 7861) -> gr.Blocks:
                     hojo_en_voice, hojo_zh_voice, hojo_max_tokens,
                     hojo_queue, hojo_keep_wav, hojo_output,
                     hojo_gain, hojo_npu_core,
-                    input_source, input_wav, file_input_mode]
+                    input_source, input_wav, file_input_mode,
+                    diarization_mode, diarization_chunk, diarization_wait]
 
         def save_values(path_text: str, *values: Any) -> tuple[str, str]:
             config = _read(path_text)
@@ -396,37 +411,64 @@ def build_ui(config_path: Path, apm_port: int = 7861) -> gr.Blocks:
             vad.update({"enabled": bool(values[9]), "library": str(values[10]).strip(), "model_path": str(values[11]).strip(), "threshold": float(values[12]), "min_speech_ms": int(values[13]), "min_segment_seconds": float(values[14]), "max_segment_seconds": float(values[15]), "trailing_silence_seconds": float(values[16])})
             if vad["max_segment_seconds"] <= vad["min_segment_seconds"] + vad["trailing_silence_seconds"]:
                 raise gr.Error("最长累积必须大于最短累积 + 末尾静音触发时长")
-            config.setdefault("campplus", {}).update({"enabled": bool(values[17]), "logging_enabled": bool(values[18]), "model_path": str(values[19]).strip(), "speaker_table_path": str(values[20]).strip(), "min_cluster_size": int(values[21]), "merge_cosine": float(values[22]), "speaker_match_threshold": float(values[23])})
+            diarization = config.setdefault("diarization", {})
+            diarization.update({
+                "enabled": bool(values[17]),
+                "logging_enabled": bool(values[18]),
+                "runner": str(values[19]).strip(),
+                "model_path": str(values[20]).strip(),
+                "speaker_table_path": str(values[21]).strip(),
+                "speaker_match_threshold": float(values[22]),
+                "step_sec": float(values[23]),
+                "omp_threads": int(values[24]),
+            })
+            if not diarization["runner"] or not diarization["model_path"] or not diarization["speaker_table_path"]:
+                raise gr.Error("说话人分离 Worker、模型目录和说话人库路径不能为空")
+            if not -1 <= diarization["speaker_match_threshold"] <= 1:
+                raise gr.Error("说话人匹配阈值必须在 [-1, 1]")
+            if not 0 < diarization["step_sec"] <= 10:
+                raise gr.Error("说话人分割滑动步长必须在 (0, 10] 秒")
+            if not 1 <= diarization["omp_threads"] <= 64:
+                raise gr.Error("说话人分离 OpenMP 线程数必须在 [1, 64]")
+            diarization["mode"] = str(values[-3]).strip() or "segment"
+            if diarization["mode"] not in ("segment", "session"):
+                raise gr.Error("说话人分离模式必须是 segment 或 session")
+            diarization["session_chunk_sec"] = float(values[-2])
+            if not 20 <= diarization["session_chunk_sec"] <= 600:
+                raise gr.Error("流式分块长度必须在 [20, 600] 秒")
+            diarization["session_max_wait_sec"] = float(values[-1])
+            if not 0 <= diarization["session_max_wait_sec"] <= 900:
+                raise gr.Error("标签最长等待必须在 [0, 900] 秒")
             asr = config.setdefault("asr", {})
             asr.pop("runner", None)
-            asr.update({"enabled": bool(values[24]), "library": str(values[25]).strip(), "model_path": str(values[26]).strip(), "model_type": str(values[27]).strip(), "language": str(values[28]).strip(), "npu_core": 1})
-            config.setdefault("output", {}).update({"text_file": str(values[29]).strip(), "temp_dir": str(values[30]).strip(), "mp3_dir": str(values[31]).strip(), "max_mp3_storage_mb": int(values[32])})
+            asr.update({"enabled": bool(values[25]), "library": str(values[26]).strip(), "model_path": str(values[27]).strip(), "model_type": str(values[28]).strip(), "language": str(values[29]).strip(), "npu_core": 1})
+            config.setdefault("output", {}).update({"text_file": str(values[30]).strip(), "temp_dir": str(values[31]).strip(), "mp3_dir": str(values[32]).strip(), "max_mp3_storage_mb": int(values[33])})
             llm = config.setdefault("llm", {})
             llm.update({
-                "enabled": bool(values[33]),
-                "model_path": str(values[34]).strip(),
-                "runner": str(values[35]).strip(),
-                "system_prompt": str(values[36]),
-                "translation_mode": bool(values[37]),
-                "zh_to_en_prompt": str(values[38]),
-                "en_to_zh_prompt": str(values[39]),
-                "dynamic_load": bool(values[40]),
-                "dynamic_load_pool_size": int(values[41]),
-                "memory_guard": bool(values[42]),
-                "memory_guard_floor_mb": int(values[43]),
-                "max_tokens": int(values[44]),
-                "temperature": float(values[45]),
-                "top_p": float(values[46]),
-                "top_k": int(values[47]),
-                "repetition_penalty": float(values[48]),
-                "frequency_penalty": float(values[49]),
-                "presence_penalty": float(values[50]),
-                "thinking_mode": str(values[51]),
-                "reset_context": bool(values[52]),
-                "stream_tokens": bool(values[53]),
-                "queue_capacity": int(values[54]),
-                "output_file": str(values[55]).strip(),
-                "npu_lock_file": str(values[56]).strip(),
+                "enabled": bool(values[34]),
+                "model_path": str(values[35]).strip(),
+                "runner": str(values[36]).strip(),
+                "system_prompt": str(values[37]),
+                "translation_mode": bool(values[38]),
+                "zh_to_en_prompt": str(values[39]),
+                "en_to_zh_prompt": str(values[40]),
+                "dynamic_load": bool(values[41]),
+                "dynamic_load_pool_size": int(values[42]),
+                "memory_guard": bool(values[43]),
+                "memory_guard_floor_mb": int(values[44]),
+                "max_tokens": int(values[45]),
+                "temperature": float(values[46]),
+                "top_p": float(values[47]),
+                "top_k": int(values[48]),
+                "repetition_penalty": float(values[49]),
+                "frequency_penalty": float(values[50]),
+                "presence_penalty": float(values[51]),
+                "thinking_mode": str(values[52]),
+                "reset_context": bool(values[53]),
+                "stream_tokens": bool(values[54]),
+                "queue_capacity": int(values[55]),
+                "output_file": str(values[56]).strip(),
+                "npu_lock_file": str(values[57]).strip(),
             })
             if not llm["model_path"] or not llm["runner"] or not llm["zh_to_en_prompt"] or not llm["en_to_zh_prompt"] or not llm["output_file"] or not llm["npu_lock_file"]:
                 raise gr.Error("Qwen3 模型、Worker、翻译提示词、输出文件和 NPU2 锁路径不能为空")
@@ -444,17 +486,17 @@ def build_ui(config_path: Path, apm_port: int = 7861) -> gr.Blocks:
             hojo.pop("core", None)
             hojo.pop("keep_prompt", None)
             hojo.update({
-                "enabled": bool(values[57]),
-                "runner": str(values[58]).strip(),
-                "model_path": str(values[59]).strip(),
-                "english_voice": int(values[60]),
-                "chinese_voice": int(values[61]),
-                "max_new_tokens": int(values[62]),
-                "queue_capacity": int(values[63]),
-                "keep_wav": bool(values[64]),
-                "output_dir": str(values[65]).strip(),
-                "playback_gain": float(values[66]),
-                "npu_core": int(values[67]),
+                "enabled": bool(values[58]),
+                "runner": str(values[59]).strip(),
+                "model_path": str(values[60]).strip(),
+                "english_voice": int(values[61]),
+                "chinese_voice": int(values[62]),
+                "max_new_tokens": int(values[63]),
+                "queue_capacity": int(values[64]),
+                "keep_wav": bool(values[65]),
+                "output_dir": str(values[66]).strip(),
+                "playback_gain": float(values[67]),
+                "npu_core": int(values[68]),
             })
             if not hojo["runner"] or not hojo["model_path"] or not hojo["output_dir"]:
                 raise gr.Error("Hojo 常驻程序、模型和输出目录不能为空")
@@ -470,9 +512,9 @@ def build_ui(config_path: Path, apm_port: int = 7861) -> gr.Blocks:
                 raise gr.Error("启用 Hojo TTS 前必须启用 Qwen3 LLM")
             runtime = config.setdefault("runtime", {})
             runtime.update({
-                "input": str(values[68]),
-                "input_wav": str(values[69]).strip(),
-                "file_input_mode": str(values[70]),
+                "input": str(values[69]),
+                "input_wav": str(values[70]).strip(),
+                "file_input_mode": str(values[71]),
             })
             if runtime["input"] not in {"alsa", "file"}:
                 raise gr.Error("输入源只能选择 alsa 或 file")

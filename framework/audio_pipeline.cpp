@@ -2,7 +2,6 @@
 #include "fastenhance_c_api.h"
 #include "ten_vad.h"
 #include "ax_asr_api.h"
-#include "campplus.h"
 #include "hojo/text_chunks.h"
 #include <future>
 
@@ -440,22 +439,29 @@ struct Segment {
   size_t start = 0, end = 0;
   std::vector<int16_t> samples;
   std::vector<std::size_t> join_points;
+  // (concat_offset, source_offset) pairs: start of every voiced run.  Used by
+  // the offline evaluation harness to map segment coordinates back to source
+  // time; harmless in production and written as <wav>.runs.txt.
+  std::vector<std::pair<std::size_t, std::size_t>> runs;
+  // Raw (silence-preserving) audio from the first voiced sample to the segment
+  // end, plus its source offset.  Diarization runs on this window so the model
+  // keeps turn-taking and overlap cues; ASR still uses the voiced-concatenated
+  // `samples` above.
+  std::vector<int16_t> raw_samples;
+  std::size_t raw_start = 0;
   std::vector<Part> parts;
   WallClock::time_point wall_start, wall_end;
 };
 
 class Accumulator {
  public:
-  Accumulator(const apm_example::AppConfig& c, NpuArbiter* arbiter,
+  Accumulator(const apm_example::AppConfig& c,
               std::function<void(Segment)> submit)
       : min_burst_(c.vad.min_speech_ms * kRateOut / 1000),
         min_segment_(std::max(1, static_cast<int>(std::lround(c.vad.min_segment_seconds * kRateOut)))),
         max_(std::max(1, static_cast<int>(std::lround(c.vad.max_segment_seconds * kRateOut)))),
         trailing_(std::max(1, static_cast<int>(std::lround(c.vad.trailing_silence_seconds * kRateOut)))),
         submit_(std::move(submit)),
-        campplus_(c.campplus,
-                  arbiter ? [arbiter] { arbiter->VadLock(); } : std::function<void()>{},
-                  arbiter ? [arbiter] { arbiter->Unlock(); } : std::function<void()>{}),
         start_wall_(WallClock::now()) {
     std::cerr << "[vad] accumulator min=" << min_segment_ / static_cast<double>(kRateOut)
               << "s max=" << max_ / static_cast<double>(kRateOut)
@@ -465,26 +471,30 @@ class Accumulator {
     if (voiced) {
       if (!in_voice_) {
         burst_start_ = cursor_;
-        if (!burst_.empty()) {
-          if (campplus_sent_in_burst_ > 0)
-            MarkCampplusJoin(campplus_sample_count_);
-          else
-            pending_burst_joins_.push_back(burst_.size());
+        if (burst_.empty()) {
+          // First voiced run of a new segment: start recording the raw window
+          // (with silences) for diarization.
+          raw_.clear();
+          raw_start_ = cursor_;
+          raw_active_ = true;
         }
+        if (raw_active_) raw_.insert(raw_.end(), hop.begin(), hop.end());
+        if (!burst_.empty()) {
+          // Speech resumed after a pause shorter than the trailing-silence
+          // threshold.  Record the removed-silence boundary for the .joins
+          // sidecar; diarization no longer depends on it.
+          const std::size_t point = buffer_.size() + burst_.size();
+          runs_.push_back({point, cursor_});
+          if (point > 0 &&
+              (join_points_.empty() || join_points_.back() != point))
+            join_points_.push_back(point);
+        } else {
+          runs_.push_back({0, cursor_});
+        }
+      } else {
+        if (raw_active_) raw_.insert(raw_.end(), hop.begin(), hop.end());
       }
       burst_.insert(burst_.end(), hop.begin(), hop.end());
-      if (burst_.size() >= static_cast<std::size_t>(min_burst_)) {
-        if (campplus_sent_in_burst_ == 0) {
-          for (std::size_t point : pending_burst_joins_)
-            MarkCampplusJoin(campplus_sample_count_ + point);
-          pending_burst_joins_.clear();
-        }
-        std::vector<int16_t> unsent(
-            burst_.begin() + campplus_sent_in_burst_, burst_.end());
-        campplus_.Push(unsent);
-        campplus_sample_count_ += unsent.size();
-        campplus_sent_in_burst_ = burst_.size();
-      }
       last_voice_ = cursor_ + hop.size();
       have_voice_ = true;
       in_voice_ = true;
@@ -496,6 +506,7 @@ class Accumulator {
         Emit();
       }
     } else {
+      if (raw_active_) raw_.insert(raw_.end(), hop.begin(), hop.end());
       in_voice_ = false;
       const size_t total = buffer_.size() + burst_.size();
       // Do not start the silence timer until the accumulated speech has
@@ -508,6 +519,9 @@ class Accumulator {
           buffer_.insert(buffer_.end(), burst_.begin(), burst_.end());
         } else {
           std::cerr << "[vad] discarded short burst=" << burst_.size() / static_cast<double>(kRateOut) << "s\n";
+          runs_.clear();
+          raw_.clear();
+          raw_active_ = false;
         }
         burst_.clear();
         // A trailing-silence boundary completes the current utterance.  The
@@ -519,42 +533,37 @@ class Accumulator {
     }
     cursor_ += hop.size();
   }
-  void Flush() { if (burst_.size() >= static_cast<size_t>(min_burst_)) { if (campplus_sent_in_burst_ < burst_.size()) { for (std::size_t point : pending_burst_joins_) MarkCampplusJoin(campplus_sample_count_ + point); pending_burst_joins_.clear(); std::vector<int16_t> unsent(burst_.begin() + campplus_sent_in_burst_, burst_.end()); campplus_.Push(unsent); campplus_sample_count_ += unsent.size(); campplus_sent_in_burst_ = burst_.size(); } if (buffer_.empty()) start_ = burst_start_; buffer_.insert(buffer_.end(), burst_.begin(), burst_.end()); } if (!buffer_.empty()) Emit(); burst_.clear(); }
+  void Flush() { if (burst_.size() >= static_cast<size_t>(min_burst_)) { if (buffer_.empty()) start_ = burst_start_; buffer_.insert(buffer_.end(), burst_.begin(), burst_.end()); } else { runs_.clear(); raw_.clear(); raw_active_ = false; } if (!buffer_.empty()) Emit(); burst_.clear(); }
  private:
-  void MarkCampplusJoin(std::size_t point) {
-    if (point == 0) return;
-    if (join_points_.empty() || join_points_.back() != point)
-      join_points_.push_back(point);
-    campplus_.MarkJoinPoint(point);
-  }
   void Emit() {
     if (buffer_.empty()) return;
     Segment s;
     s.start = start_;
     s.end = have_voice_ ? last_voice_ : cursor_;
     s.samples = std::move(buffer_);
-    s.join_points = join_points_;
+    s.runs = std::move(runs_);
+    runs_.clear();
+    s.raw_samples = std::move(raw_);
+    s.raw_start = raw_start_;
+    raw_.clear();
+    raw_active_ = false;
+    for (std::size_t point : join_points_)
+      if (point > 0 && point < s.samples.size()) s.join_points.push_back(point);
     s.wall_start = start_wall_ + std::chrono::milliseconds(static_cast<int64_t>(s.start) * 1000 / kRateOut);
     s.wall_end = start_wall_ + std::chrono::milliseconds(static_cast<int64_t>(s.end) * 1000 / kRateOut);
-    const std::string segment_name = TimeStamp(s.wall_start) + "_" +
-                                     TimeStamp(s.wall_end) + ".wav";
-    for (const auto& p : campplus_.Finalize(
-             s.samples.size(), segment_name, s.join_points))
-      s.parts.push_back({p.begin, p.end, p.speaker_id});
+    // Speaker parts are produced by the resident diar-worker in the result
+    // worker, after the segment WAV is written and off the capture path.
     std::cerr << "[vad] segment submitted duration="
               << s.samples.size() / static_cast<double>(kRateOut) << "s\n";
     submit_(std::move(s));
     buffer_.clear();
     join_points_.clear();
-    pending_burst_joins_.clear();
-    campplus_sample_count_ = 0;
-    campplus_sent_in_burst_ = 0;
     // A max-length split also ends the current burst logically.  This makes
     // the next voiced hop establish a fresh start offset and end timestamp.
     in_voice_ = false;
     have_voice_ = false;
   }
-  int min_burst_, min_segment_, max_, trailing_; std::function<void(Segment)> submit_; campplus::Session campplus_; WallClock::time_point start_wall_; std::vector<int16_t> buffer_, burst_; std::vector<std::size_t> join_points_, pending_burst_joins_; size_t start_ = 0, burst_start_ = 0, cursor_ = 0, last_voice_ = 0, campplus_sample_count_ = 0, campplus_sent_in_burst_ = 0; bool in_voice_ = false, have_voice_ = false;
+  int min_burst_, min_segment_, max_, trailing_; std::function<void(Segment)> submit_; WallClock::time_point start_wall_; std::vector<int16_t> buffer_, burst_; std::vector<std::size_t> join_points_; std::vector<std::pair<std::size_t, std::size_t>> runs_; std::vector<int16_t> raw_; std::size_t raw_start_ = 0; bool raw_active_ = false; size_t start_ = 0, burst_start_ = 0, cursor_ = 0, last_voice_ = 0; bool in_voice_ = false, have_voice_ = false;
 };
 
 bool WriteWav(const fs::path& path, const std::vector<int16_t>& samples, int rate) {
@@ -574,6 +583,99 @@ bool WriteJoinPoints(const fs::path& wav,
   for (std::size_t point : join_points)
     out << point << ' ' << point * 1000 / static_cast<std::size_t>(rate) << '\n';
   return static_cast<bool>(out);
+}
+
+bool WriteRuns(const fs::path& wav,
+               const std::vector<std::pair<std::size_t, std::size_t>>& runs) {
+  const fs::path path = wav.string() + ".runs.txt";
+  std::ofstream out(path);
+  if (!out) return false;
+  out << "# concat_offset source_offset\n";
+  for (const auto& run : runs) out << run.first << ' ' << run.second << '\n';
+  return static_cast<bool>(out);
+}
+
+bool WriteParts(const fs::path& wav, const std::vector<Segment::Part>& parts) {
+  const fs::path path = wav.string() + ".parts.txt";
+  std::ofstream out(path);
+  if (!out) return false;
+  out << parts.size() << "\n";
+  for (const auto& part : parts)
+    out << part.begin << ' ' << part.end << ' ' << part.speaker_id << '\n';
+  return static_cast<bool>(out);
+}
+
+// Project a speaker timeline onto the VAD-voiced concatenated timeline used by
+// ASR.  `timeline` entries are relative to `timeline_offset` (0 for session
+// diarization in file coordinates, the window start for per-segment raw
+// windows).  `runs` maps concatenated offsets to absolute pipeline-stream
+// offsets.  On overlap the longest timeline range wins, then unassigned
+// samples inherit the nearest label so the resulting ranges partition
+// [0, trimmed_samples).
+std::vector<Segment::Part> MapTimelineToTrimmed(
+    const std::vector<Segment::Part>& timeline,
+    std::size_t timeline_offset,
+    const std::vector<std::pair<std::size_t, std::size_t>>& runs,
+    std::size_t trimmed_samples) {
+  std::vector<Segment::Part> parts;
+  if (timeline.empty() || runs.empty() || trimmed_samples == 0) return parts;
+  std::vector<int> label(trimmed_samples, -1);
+  std::vector<std::size_t> order(timeline.size());
+  for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+    return (timeline[a].end - timeline[a].begin) >
+           (timeline[b].end - timeline[b].begin);
+  });
+  for (std::size_t idx : order) {
+    const auto& entry = timeline[idx];
+    if (entry.end <= entry.begin) continue;
+    const std::size_t part_begin = entry.begin + timeline_offset;
+    const std::size_t part_end = entry.end + timeline_offset;
+    for (std::size_t r = 0; r < runs.size(); ++r) {
+      const std::size_t run_concat = runs[r].first;
+      const std::size_t run_source = runs[r].second;
+      const std::size_t run_concat_end =
+          (r + 1 < runs.size()) ? runs[r + 1].first : trimmed_samples;
+      if (run_concat_end <= run_concat) continue;
+      const std::size_t run_source_end = run_source + (run_concat_end - run_concat);
+      const std::size_t begin = std::max(part_begin, run_source);
+      const std::size_t end = std::min(part_end, run_source_end);
+      if (end <= begin) continue;
+      const std::size_t concat_begin = run_concat + (begin - run_source);
+      const std::size_t concat_end = run_concat + (end - run_source);
+      for (std::size_t s = concat_begin; s < concat_end && s < trimmed_samples; ++s)
+        if (label[s] < 0) label[s] = static_cast<int>(idx);
+    }
+  }
+  int current = -1;
+  for (std::size_t i = 0; i < trimmed_samples; ++i) {
+    if (label[i] >= 0) current = label[i];
+    else if (current >= 0) label[i] = current;
+  }
+  current = -1;
+  for (std::size_t i = trimmed_samples; i-- > 0;) {
+    if (label[i] >= 0) current = label[i];
+    else if (current >= 0) label[i] = current;
+  }
+  std::size_t i = 0;
+  while (i < trimmed_samples) {
+    const int id = label[i];
+    std::size_t j = i;
+    while (j < trimmed_samples && label[j] == id) ++j;
+    if (id >= 0 && j > i) {
+      const std::string& speaker =
+          timeline[static_cast<std::size_t>(id)].speaker_id;
+      if (!speaker.empty()) {
+        Segment::Part part;
+        part.begin = i;
+        part.end = j;
+        part.speaker_id = speaker;
+        parts.push_back(std::move(part));
+      }
+    }
+    i = j;
+  }
+  return parts;
 }
 
 std::string ShellQuote(const std::string& s) { std::string out = "'"; for (char c : s) { if (c == '\'') out += "'\\''"; else out += c; } return out + "'"; }
@@ -1413,6 +1515,492 @@ class HojoTtsWorker {
   bool closed_ = false;
 };
 
+// Resident pyannote diarization worker client.  The worker keeps the eight
+// axmodels loaded and owns the persistent speaker table; one request maps a
+// segment WAV to non-overlapping speaker ranges.  A request holds the NPU2
+// Cell lock so diarization never overlaps SenseVoice/Qwen3/Hojo inference.
+class DiarWorker {
+ public:
+  DiarWorker(const apm_example::AppConfig::Diarization& config,
+             Npu2CellArbiter* arbiter)
+      : config_(config), arbiter_(arbiter) {}
+  ~DiarWorker() { Close(); }
+
+  // Starts the worker process.  Must be called after the pipeline has
+  // initialized AX Engine in BIG_LITTLE mode: the community-1 models require
+  // a VNPU-disabled init, and initializing that before BIG_LITTLE makes the
+  // pipeline's own AX_ENGINE_Init fail on this board.
+  bool Start() {
+    if (!config_.enabled || active_) return active_;
+    if (!StartProcess()) {
+      std::cerr << "[diar] worker startup failed\n";
+      return false;
+    }
+    active_ = true;
+    return true;
+  }
+
+  bool active() const { return active_; }
+
+  // Returns sample ranges labelled with persistent speaker ids.  An empty
+  // result means diarization was unavailable for this segment; the caller
+  // falls back to whole-segment ASR.
+  std::vector<Segment::Part> Label(const std::string& wav_path,
+                                   std::size_t sample_count) {
+    if (!active_) return {};
+    std::lock_guard<std::mutex> guard(mutex_);
+    try {
+      auto lease = arbiter_->Acquire();
+      const uint32_t size = static_cast<uint32_t>(wav_path.size());
+      if (!WriteAllFd(input_fd_, &size, sizeof(size)) ||
+          !WriteAllFd(input_fd_, wav_path.data(), wav_path.size()))
+        throw std::runtime_error("worker input pipe closed");
+      char type = 0;
+      std::string payload;
+      if (!ReadFrame(response_fd_, &type, &payload))
+        throw std::runtime_error("worker response pipe closed");
+      if (type != 'R')
+        throw std::runtime_error(payload.empty() ? "worker error" : payload);
+      return ParseParts(payload, sample_count);
+    } catch (const std::exception& error) {
+      std::cerr << "[diar] " << error.what() << "\n";
+      return {};
+    }
+  }
+
+  void Close() {
+    if (closed_) return;
+    closed_ = true;
+    if (input_fd_ >= 0) close(input_fd_);
+    if (response_fd_ >= 0) close(response_fd_);
+    input_fd_ = response_fd_ = -1;
+    if (pid_ > 0) {
+      int status = 0;
+      while (waitpid(pid_, &status, 0) < 0 && errno == EINTR) {}
+      pid_ = -1;
+    }
+    active_ = false;
+  }
+
+ private:
+  static bool WriteAllFd(int fd, const void* data, std::size_t size) {
+    const auto* input = static_cast<const unsigned char*>(data);
+    while (size > 0) {
+      const ssize_t count = write(fd, input, size);
+      if (count <= 0) {
+        if (count < 0 && errno == EINTR) continue;
+        return false;
+      }
+      input += count;
+      size -= static_cast<std::size_t>(count);
+    }
+    return true;
+  }
+
+  static bool ReadAllFd(int fd, void* data, std::size_t size) {
+    auto* output = static_cast<unsigned char*>(data);
+    while (size > 0) {
+      const ssize_t count = read(fd, output, size);
+      if (count == 0) return false;
+      if (count < 0) {
+        if (errno == EINTR) continue;
+        return false;
+      }
+      output += count;
+      size -= static_cast<std::size_t>(count);
+    }
+    return true;
+  }
+
+  static bool ReadFrame(int fd, char* type, std::string* payload) {
+    uint32_t size = 0;
+    if (!ReadAllFd(fd, type, sizeof(*type)) ||
+        !ReadAllFd(fd, &size, sizeof(size)) || size > 64U * 1024U * 1024U)
+      return false;
+    payload->assign(size, '\0');
+    return ReadAllFd(fd, payload->data(), payload->size());
+  }
+
+  static std::vector<Segment::Part> ParseParts(const std::string& payload,
+                                               std::size_t sample_count) {
+    std::vector<Segment::Part> parts;
+    std::istringstream in(payload);
+    std::size_t count = 0;
+    if (!(in >> count)) throw std::runtime_error("invalid diarization response");
+    parts.reserve(std::min<std::size_t>(count, 256));
+    for (std::size_t i = 0; i < count; ++i) {
+      std::size_t begin = 0, end = 0;
+      std::string speaker;
+      if (!(in >> begin >> end >> speaker)) {
+        std::string detail = payload.substr(0, 160);
+        for (char& c : detail) if (c == '\n') c = '|';
+        throw std::runtime_error("truncated diarization response count=" +
+                                 std::to_string(count) + " index=" +
+                                 std::to_string(i) + " payload='" + detail + "'");
+      }
+      if (end <= begin) continue;
+      if (begin > sample_count) begin = sample_count;
+      if (end > sample_count) end = sample_count;
+      if (end <= begin) continue;
+      Segment::Part part;
+      part.begin = begin;
+      part.end = end;
+      part.speaker_id = std::move(speaker);
+      parts.push_back(std::move(part));
+    }
+    return parts;
+  }
+
+  static void AddArg(std::vector<std::string>* args,
+                     const std::string& name, const std::string& value) {
+    args->push_back(name);
+    args->push_back(value);
+  }
+
+  bool StartProcess() {
+    const std::string executable = FindExecutable(config_.runner);
+    if (executable.empty()) {
+      std::cerr << "[diar] runner is not executable: " << config_.runner << "\n";
+      return false;
+    }
+    int input_pipe[2] = {-1, -1};
+    int response_pipe[2] = {-1, -1};
+    if (pipe2(input_pipe, O_CLOEXEC) != 0 ||
+        pipe2(response_pipe, O_CLOEXEC) != 0) {
+      std::cerr << "[diar] cannot create worker pipes\n";
+      for (int fd : input_pipe) if (fd >= 0) close(fd);
+      for (int fd : response_pipe) if (fd >= 0) close(fd);
+      return false;
+    }
+
+    std::vector<std::string> args{executable};
+    AddArg(&args, "--model", AbsolutePath(config_.model_path));
+    AddArg(&args, "--table", config_.speaker_table_path);
+    AddArg(&args, "--step", std::to_string(config_.step_sec));
+    AddArg(&args, "--threshold", std::to_string(config_.speaker_match_threshold));
+    AddArg(&args, "--threads", std::to_string(config_.omp_threads));
+    AddArg(&args, "--response-fd", "3");
+
+    pid_ = fork();
+    if (pid_ < 0) {
+      std::cerr << "[diar] fork failed\n";
+      for (int fd : input_pipe) close(fd);
+      for (int fd : response_pipe) close(fd);
+      return false;
+    }
+    if (pid_ == 0) {
+      dup2(input_pipe[0], STDIN_FILENO);
+      dup2(response_pipe[1], 3);
+      for (int fd : input_pipe)
+        if (fd != STDIN_FILENO && fd != 3) close(fd);
+      for (int fd : response_pipe)
+        if (fd != STDIN_FILENO && fd != 3) close(fd);
+      std::vector<char*> argv;
+      argv.reserve(args.size() + 1);
+      for (std::string& arg : args) argv.push_back(arg.data());
+      argv.push_back(nullptr);
+      execv(executable.c_str(), argv.data());
+      const std::string message = "exec failed: " + std::string(std::strerror(errno));
+      const char type = 'E';
+      const uint32_t size = static_cast<uint32_t>(message.size());
+      WriteAllFd(3, &type, sizeof(type));
+      WriteAllFd(3, &size, sizeof(size));
+      WriteAllFd(3, message.data(), message.size());
+      _exit(127);
+    }
+    close(input_pipe[0]);
+    close(response_pipe[1]);
+    input_fd_ = input_pipe[1];
+    response_fd_ = response_pipe[0];
+
+    char type = 0;
+    std::string message;
+    if (!ReadFrame(response_fd_, &type, &message) || type != 'R') {
+      std::cerr << "[diar] startup failed: "
+                << (message.empty() ? "worker exited" : message) << "\n";
+      close(input_fd_);
+      close(response_fd_);
+      input_fd_ = response_fd_ = -1;
+      int status = 0;
+      while (waitpid(pid_, &status, 0) < 0 && errno == EINTR) {}
+      pid_ = -1;
+      return false;
+    }
+    std::cerr << "[diar] pyannote worker loaded; speaker table="
+              << config_.speaker_table_path << "\n";
+    return true;
+  }
+
+  apm_example::AppConfig::Diarization config_;
+  Npu2CellArbiter* arbiter_;
+  int input_fd_ = -1;
+  int response_fd_ = -1;
+  pid_t pid_ = -1;
+  bool active_ = false;
+  bool closed_ = false;
+  std::mutex mutex_;
+};
+
+// Reads the sample rate from a RIFF/WAVE file; returns 0 when the file is not
+// a readable WAV.  Session diarization needs the source sample rate to map the
+// worker's sample coordinates onto the pipeline's 16 kHz stream.
+int ReadWavSampleRate(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return 0;
+  char header[12];
+  if (!in.read(header, sizeof(header)) ||
+      std::memcmp(header, "RIFF", 4) != 0 ||
+      std::memcmp(header + 8, "WAVE", 4) != 0)
+    return 0;
+  while (in) {
+    char chunk[8];
+    if (!in.read(chunk, sizeof(chunk))) break;
+    const uint32_t size =
+        static_cast<uint8_t>(chunk[4]) |
+        (static_cast<uint8_t>(chunk[5]) << 8) |
+        (static_cast<uint8_t>(chunk[6]) << 16) |
+        (static_cast<uint8_t>(chunk[7]) << 24);
+    if (std::memcmp(chunk, "fmt ", 4) == 0) {
+      std::vector<char> fmt(size);
+      if (!in.read(fmt.data(), static_cast<std::streamsize>(fmt.size())) ||
+          fmt.size() < 8)
+        return 0;
+      return static_cast<int>(
+          static_cast<uint8_t>(fmt[4]) |
+          (static_cast<uint8_t>(fmt[5]) << 8) |
+          (static_cast<uint8_t>(fmt[6]) << 16) |
+          (static_cast<uint8_t>(fmt[7]) << 24));
+    }
+    in.seekg(size, std::ios::cur);
+  }
+  return 0;
+}
+
+// Runs the diar-worker binary once over a whole source file (one-shot mode)
+// and returns its non-overlapping speaker ranges scaled to 16 kHz pipeline
+// coordinates.  Used by diarization.mode=session for file inputs.
+std::vector<Segment::Part> RunSessionDiarization(
+    const apm_example::AppConfig::Diarization& config,
+    const std::string& wav_path, int source_rate) {
+  std::vector<Segment::Part> parts;
+  const std::string executable = FindExecutable(config.runner);
+  if (executable.empty()) {
+    std::cerr << "[diar] session runner is not executable: " << config.runner
+              << "\n";
+    return parts;
+  }
+  int out_pipe[2] = {-1, -1};
+  if (pipe2(out_pipe, O_CLOEXEC) != 0) {
+    std::cerr << "[diar] session pipe failed\n";
+    return parts;
+  }
+  std::vector<std::string> args{executable};
+  args.push_back("--model");
+  args.push_back(AbsolutePath(config.model_path));
+  args.push_back("--table");
+  args.push_back(config.speaker_table_path);
+  args.push_back("--step");
+  args.push_back(std::to_string(config.step_sec));
+  args.push_back("--threshold");
+  args.push_back(std::to_string(config.speaker_match_threshold));
+  args.push_back("--threads");
+  args.push_back(std::to_string(config.omp_threads));
+  args.push_back("--wav");
+  args.push_back(AbsolutePath(wav_path));
+  const pid_t pid = fork();
+  if (pid < 0) {
+    close(out_pipe[0]);
+    close(out_pipe[1]);
+    std::cerr << "[diar] session fork failed\n";
+    return parts;
+  }
+  if (pid == 0) {
+    dup2(out_pipe[1], STDOUT_FILENO);
+    close(out_pipe[0]);
+    close(out_pipe[1]);
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (std::string& arg : args) argv.push_back(arg.data());
+    argv.push_back(nullptr);
+    execv(executable.c_str(), argv.data());
+    _exit(127);
+  }
+  close(out_pipe[1]);
+  std::string payload;
+  char buffer[4096];
+  ssize_t count = 0;
+  while ((count = read(out_pipe[0], buffer, sizeof(buffer))) > 0)
+    payload.append(buffer, static_cast<std::size_t>(count));
+  close(out_pipe[0]);
+  int status = 0;
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    std::cerr << "[diar] session diarization failed (status=" << status << ")\n";
+    return {};
+  }
+  std::istringstream in(payload);
+  std::size_t size = 0;
+  if (!(in >> size)) {
+    std::cerr << "[diar] session diarization returned no parsable parts\n";
+    return {};
+  }
+  const double scale =
+      source_rate > 0 ? static_cast<double>(kRateOut) / source_rate : 1.0;
+  for (std::size_t i = 0; i < size; ++i) {
+    std::size_t begin = 0, end = 0;
+    std::string speaker;
+    if (!(in >> begin >> end >> speaker)) break;
+    if (end <= begin) continue;
+    Segment::Part part;
+    part.begin = static_cast<std::size_t>(std::llround(begin * scale));
+    part.end = static_cast<std::size_t>(std::llround(end * scale));
+    part.speaker_id = std::move(speaker);
+    parts.push_back(std::move(part));
+  }
+  std::cerr << "[diar] session timeline parts=" << parts.size()
+            << " source_rate=" << source_rate << "\n";
+  return parts;
+}
+
+// Streaming session diarization for realtime inputs: buffers raw 16 kHz audio
+// (silences preserved), sends fixed chunks to the resident diar-worker, and
+// appends the chunk's speaker parts (matched to the persistent table) to an
+// absolute timeline.  ResultWorker maps each VAD segment onto that timeline.
+class SessionDiarizer {
+ public:
+  explicit SessionDiarizer(double chunk_sec)
+      : chunk_samples_(static_cast<std::size_t>(
+            std::max(1.0, chunk_sec) * kRateOut)) {}
+  ~SessionDiarizer() { Stop(); }
+
+  void Start(DiarWorker* worker, const std::string& work_dir) {
+    worker_ = worker;
+    work_dir_ = work_dir;
+    std::error_code ec;
+    fs::create_directories(work_dir_, ec);
+    thread_ = std::thread([this] { Loop(); });
+  }
+
+  // Called from the capture thread for every 16 kHz hop (voiced or silent).
+  void Append(const std::vector<int16_t>& hop) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (closed_) return;
+    buffer_.insert(buffer_.end(), hop.begin(), hop.end());
+    if (buffer_.size() >= chunk_samples_) ready_.notify_all();
+  }
+
+  bool Covers(std::size_t end) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return committed_ >= end;
+  }
+
+  // Waits until the timeline covers `end`; false on timeout or shutdown.
+  bool WaitCovered(std::size_t end, std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    const bool notified = ready_.wait_for(lock, timeout,
+        [&] { return closed_ || committed_ >= end; });
+    return notified && committed_ >= end;
+  }
+
+  std::vector<Segment::Part> Timeline() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return timeline_;
+  }
+
+  // Processes the final partial chunk (pipeline shutdown); call after Stop().
+  void ProcessRemaining() {
+    std::vector<int16_t> chunk;
+    std::size_t chunk_start = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      chunk_start = committed_;
+      chunk = std::move(buffer_);
+      buffer_.clear();
+    }
+    if (!worker_ || chunk.size() < static_cast<std::size_t>(kRateOut)) return;
+    RunChunk(chunk_start, chunk);
+  }
+
+  void Stop() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      closed_ = true;
+    }
+    ready_.notify_all();
+    if (thread_.joinable()) thread_.join();
+  }
+
+ private:
+  void Loop() {
+    while (true) {
+      std::vector<int16_t> chunk;
+      std::size_t chunk_start = 0;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ready_.wait(lock,
+                    [&] { return closed_ || buffer_.size() >= chunk_samples_; });
+        if (closed_) return;
+        chunk_start = committed_;
+        chunk.assign(buffer_.begin(),
+                     buffer_.begin() + static_cast<std::ptrdiff_t>(chunk_samples_));
+      }
+      RunChunk(chunk_start, chunk);
+    }
+  }
+
+  void RunChunk(std::size_t chunk_start, const std::vector<int16_t>& chunk) {
+    if (!worker_) return;
+    const fs::path wav = fs::path(work_dir_) /
+        ("session-" + std::to_string(chunk_start) + ".wav");
+    std::vector<Segment::Part> parts;
+    if (WriteWav(wav, chunk, kRateOut)) {
+      parts = worker_->Label(wav.string(), chunk.size());
+      std::error_code ec;
+      fs::remove(wav, ec);
+    } else {
+      std::cerr << "[diar] session chunk WAV failed: " << wav << "\n";
+    }
+    std::vector<Segment::Part> commit;
+    commit.reserve(parts.size());
+    for (const auto& part : parts) {
+      Segment::Part entry;
+      entry.begin = chunk_start + part.begin;
+      entry.end = chunk_start + part.end;
+      entry.speaker_id = part.speaker_id;
+      if (entry.end > entry.begin) commit.push_back(std::move(entry));
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (auto& entry : commit) timeline_.push_back(std::move(entry));
+      std::stable_sort(timeline_.begin(), timeline_.end(),
+                       [](const Segment::Part& a, const Segment::Part& b) {
+                         return a.begin < b.begin;
+                       });
+      const std::size_t advance = chunk.size();
+      committed_ = std::max(committed_, chunk_start + advance);
+      buffer_.erase(buffer_.begin(),
+                    buffer_.begin() + static_cast<std::ptrdiff_t>(
+                        std::min(buffer_.size(), advance)));
+      std::cerr << "[diar] session chunk start=" << chunk_start / kRateOut
+                << "s len=" << advance / kRateOut << "s parts="
+                << commit.size() << " committed=" << committed_ / kRateOut
+                << "s\n";
+    }
+    ready_.notify_all();
+  }
+
+  std::size_t chunk_samples_;
+  DiarWorker* worker_ = nullptr;
+  std::string work_dir_;
+  mutable std::mutex mutex_;
+  std::condition_variable ready_;
+  std::vector<int16_t> buffer_;          // starts at absolute `committed_`
+  std::size_t committed_ = 0;            // samples fully diarized
+  std::vector<Segment::Part> timeline_;  // absolute speaker parts
+  bool closed_ = false;
+  std::thread thread_;
+};
+
 class ResultWorker {
  public:
   ResultWorker(const apm_example::AppConfig& c,
@@ -1425,6 +2013,7 @@ class ResultWorker {
              [this](const std::string& prefix) { hojo_.Begin(prefix); },
              [this](const std::string& token) { hojo_.Token(token); },
              [this](const std::string& text, bool success) { hojo_.Finish(text, success); }),
+        diarrer_(c.diarization, npu2_arbiter),
         jobs_(static_cast<std::size_t>(std::max(0, c.llm.queue_capacity))) {
     fs::create_directories(c_.output.temp_dir);
     fs::create_directories(c_.output.mp3_dir);
@@ -1466,11 +2055,59 @@ class ResultWorker {
   }
   ~ResultWorker() { Close(); }
   void Submit(Segment s) { jobs_.Push(std::move(s)); }
-  void Close(bool /*abort*/ = false) {
+  // Called once the pipeline's own AX Engine (BIG_LITTLE) is initialized.
+  void StartDiarization() {
+    if (!c_.diarization.enabled) return;
+    bool streaming_session = false;
+    if (c_.diarization.mode == "session") {
+      const bool file_input = c_.runtime.input == "file";
+      if (file_input && c_.runtime.file_input_mode != "realtime") {
+        // Batch file input: diarize the whole source once and reuse the
+        // timeline for every segment.
+        const int rate = ReadWavSampleRate(c_.runtime.input_wav);
+        if (rate <= 0) {
+          std::cerr << "[diar] cannot read input WAV rate; "
+                       "using per-segment mode\n";
+        } else {
+          std::cerr << "[diar] session diarization on " << c_.runtime.input_wav
+                    << " (rate=" << rate << ")\n";
+          session_parts_ =
+              RunSessionDiarization(c_.diarization, c_.runtime.input_wav, rate);
+          session_ready_ = !session_parts_.empty();
+        }
+      } else {
+        streaming_session = true;
+      }
+    }
+    if (!diarrer_.Start())
+      throw std::runtime_error(
+          "Speaker diarization is enabled but its worker is unavailable");
+    if (streaming_session) {
+      session_ = std::make_unique<SessionDiarizer>(
+          c_.diarization.session_chunk_sec);
+      session_->Start(&diarrer_, c_.output.temp_dir);
+      std::cerr << "[diar] streaming session diarization chunk="
+                << c_.diarization.session_chunk_sec << "s max_wait="
+                << c_.diarization.session_max_wait_sec << "s\n";
+    }
+  }
+
+  // Capture thread: feed every 16 kHz hop (voiced or silent) to the streaming
+  // session diarizer when it is active.
+  void AppendSessionSamples(const std::vector<int16_t>& hop) {
+    if (session_) session_->Append(hop);
+  }
+  void Close(bool abort = false) {
     if (closed_) return;
     closed_ = true;
+    if (session_) {
+      session_->Stop();
+      if (!abort) session_->ProcessRemaining();
+      session_.reset();
+    }
     jobs_.Close();
     if (thread_.joinable()) thread_.join();
+    diarrer_.Close();
     // Models are loaded Hojo -> Qwen -> SenseVoice. Release them in reverse
     // order so Qwen's process-wide CMM sentry does not count the later-loaded
     // SenseVoice allocation as a Qwen leak during teardown.
@@ -1492,6 +2129,59 @@ class ResultWorker {
       std::cerr << "[save] WAV saved: " << wav << " (" << s.samples.size() / static_cast<double>(kRateOut) << "s)\n";
       if (!WriteJoinPoints(wav, s.join_points, kRateOut))
         std::cerr << "[save] join-point file failed: " << wav << ".joins.txt\n";
+      if (!WriteRuns(wav, s.runs))
+        std::cerr << "[save] run-map file failed: " << wav << ".runs.txt\n";
+      if (diarrer_.active() || session_ready_ || session_) {
+        bool labeled = false;
+        // Streaming session mode: wait a bounded time for the chunked timeline
+        // to cover this segment, then map it onto the ASR timeline.
+        if (session_ && !s.runs.empty()) {
+          const std::size_t segment_end =
+              s.runs.back().second + (s.samples.size() - s.runs.back().first);
+          bool covered = session_->Covers(segment_end);
+          if (!covered && c_.diarization.session_max_wait_sec > 0.0f) {
+            covered = session_->WaitCovered(
+                segment_end,
+                std::chrono::milliseconds(static_cast<std::int64_t>(
+                    c_.diarization.session_max_wait_sec * 1000.0f)));
+            if (!covered)
+              std::cerr << "[diar] session timeline wait timed out for " << wav
+                        << "; per-segment fallback\n";
+          }
+          if (covered) {
+            s.parts = MapTimelineToTrimmed(session_->Timeline(), 0, s.runs,
+                                           s.samples.size());
+            labeled = !s.parts.empty();
+          }
+        }
+        // Whole-file session pre-run (batch file inputs).
+        if (!labeled && session_ready_ && !s.runs.empty()) {
+          s.parts = MapTimelineToTrimmed(session_parts_, 0, s.runs,
+                                         s.samples.size());
+          labeled = !s.parts.empty();
+        }
+        // Per-segment raw window fallback (silences preserved).
+        if (!labeled && !s.raw_samples.empty()) {
+          const fs::path raw_wav = wav.string() + ".raw.wav";
+          if (WriteWav(raw_wav, s.raw_samples, kRateOut)) {
+            const auto raw_parts =
+                diarrer_.Label(raw_wav.string(), s.raw_samples.size());
+            std::error_code ec;
+            fs::remove(raw_wav, ec);
+            s.parts = MapTimelineToTrimmed(raw_parts, s.raw_start, s.runs,
+                                           s.samples.size());
+            labeled = !s.parts.empty();
+          } else {
+            std::cerr << "[diar] raw window WAV failed: " << raw_wav << "\n";
+          }
+        }
+        if (!labeled && diarrer_.active())
+          s.parts = diarrer_.Label(wav.string(), s.samples.size());
+        if (!s.parts.empty()) WriteParts(wav, s.parts);
+        if (s.parts.empty())
+          std::cerr << "[diar] no speaker parts for " << wav
+                    << "; whole-segment ASR fallback\n";
+      }
       fs::create_directories(fs::path(c_.output.text_file).parent_path());
       std::ofstream txt(c_.output.text_file, std::ios::app);
       if (s.parts.empty()) {
@@ -1500,7 +2190,7 @@ class ResultWorker {
         txt << "[" << TimeStamp(s.wall_start) << " --> " << TimeStamp(s.wall_end) << "] " << text << "\n";
         llm_.ProcessAsrResult(text);
       } else {
-        // CampPlus parts are ASR-only slices.  The original VAD WAV below is
+        // Speaker parts are ASR-only slices.  The original VAD WAV below is
         // still the sole input to MP3 encoding, so speaker labeling cannot
         // change the established audio archival behavior.
         for (std::size_t i = 0; i < s.parts.size(); ++i) {
@@ -1560,8 +2250,12 @@ class ResultWorker {
   HojoTtsWorker hojo_;
   SenseVoiceRunner asr_;
   LlmWorker llm_;
+  DiarWorker diarrer_;
   BlockingQueue<Segment> jobs_;
   std::thread thread_;
+  std::vector<Segment::Part> session_parts_;
+  std::unique_ptr<SessionDiarizer> session_;
+  bool session_ready_ = false;
   std::string encoder_;
   EncoderKind encoder_kind_ = EncoderKind::kNone;
   bool closed_ = false;
@@ -1580,16 +2274,16 @@ int StopChild(Child* child) { int status = 0; if (child->in >= 0) { close(child-
 
 class Pipeline {
  public:
-  Pipeline(apm_example::AppConfig c, std::string config_path) : config_(std::move(c)), config_path_(std::move(config_path)), arbiter_(), npu2_arbiter_(config_.llm.npu_lock_file), playback_mixer_(), results_(config_, &npu2_arbiter_, [this](std::vector<int16_t> samples) { playback_mixer_.AppendTts(std::move(samples)); }), enhancer_(config_, &arbiter_), vad_(config_, &arbiter_), accumulator_(config_, &arbiter_, [this](Segment s) { results_.Submit(std::move(s)); }), vad_jobs_(std::max<size_t>(4, config_.vad.input_buffer_ms / std::max(1, config_.vad.hop_ms))), monitor_queue_(monitor_queue_capacity(config_)) { vad_thread_ = std::thread([this] { VadLoop(); }); }
+  Pipeline(apm_example::AppConfig c, std::string config_path) : config_(std::move(c)), config_path_(std::move(config_path)), arbiter_(), npu2_arbiter_(config_.llm.npu_lock_file), playback_mixer_(), results_(config_, &npu2_arbiter_, [this](std::vector<int16_t> samples) { playback_mixer_.AppendTts(std::move(samples)); }), enhancer_(config_, &arbiter_), vad_(config_, &arbiter_), accumulator_(config_, [this](Segment s) { results_.Submit(std::move(s)); }), vad_jobs_(std::max<size_t>(4, config_.vad.input_buffer_ms / std::max(1, config_.vad.hop_ms))), monitor_queue_(monitor_queue_capacity(config_)) { results_.StartDiarization(); vad_thread_ = std::thread([this] { VadLoop(); }); }
   void Run() { child_ = StartApm(config_, config_path_); std::thread monitor; if (config_.fastenhance.monitor_enabled || config_.hojo_tts.enabled) monitor = std::thread([this] { MonitorLoop(); }); std::vector<int16_t> raw(kRateIn / 100); while (!g_stop.load() && ReadAll(child_.out, raw.data(), raw.size() * sizeof(int16_t))) Process(raw); monitor_queue_.Close(); const int child_status = StopChild(&child_); if (monitor.joinable()) monitor.join(); const bool interrupted = g_stop.load(); Close(interrupted); if (!interrupted && (child_status == -1 || !WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0)) throw std::runtime_error("APM input process exited with an error"); }
   void Close(bool abort = false) { if (closed_) return; closed_ = true; if (!abort) { if (!enhance_remainder_.empty()) { const size_t n = enhance_remainder_.size(); enhance_remainder_.resize(kEnhanceHop, 0); std::vector<int16_t> tail = enhance_remainder_; enhance_remainder_.clear(); Process(tail); (void)n; } if (!vad_remainder_.empty()) { vad_remainder_.resize(vad_.Hop(), 0); if (BatchInput()) vad_jobs_.Push(vad_remainder_); else vad_jobs_.TryPush(vad_remainder_); vad_remainder_.clear(); } } vad_jobs_.Close(); if (vad_thread_.joinable()) vad_thread_.join(); if (!abort) accumulator_.Flush(); results_.Close(abort); enhancer_.Report(); vad_.Report(); }
  private:
-  void Process(const std::vector<int16_t>& input) { enhance_remainder_.insert(enhance_remainder_.end(), input.begin(), input.end()); while (enhance_remainder_.size() >= kEnhanceHop) { std::array<int16_t, kEnhanceHop> hop{}; std::copy_n(enhance_remainder_.begin(), kEnhanceHop, hop.begin()); enhance_remainder_.erase(enhance_remainder_.begin(), enhance_remainder_.begin() + kEnhanceHop); auto output = enhancer_.Process(hop); std::vector<int16_t> rendered(output.begin(), output.end()); if (!monitor_queue_.TryPush(rendered)) { monitor_queue_.TryDropOldest(); monitor_queue_.TryPush(std::move(rendered)); } std::vector<int16_t> enhanced(output.begin(), output.end()); auto down = decimator_.Process(enhanced); vad_remainder_.insert(vad_remainder_.end(), down.begin(), down.end()); while (vad_remainder_.size() >= static_cast<size_t>(vad_.Hop())) { std::vector<int16_t> v(vad_remainder_.begin(), vad_remainder_.begin() + vad_.Hop()); vad_remainder_.erase(vad_remainder_.begin(), vad_remainder_.begin() + vad_.Hop()); if (BatchInput()) vad_jobs_.Push(std::move(v)); else if (!vad_jobs_.TryPush(v)) { vad_jobs_.TryDropOldest(); vad_jobs_.TryPush(std::move(v)); } } } }
+  void Process(const std::vector<int16_t>& input) { { auto diar_down = diar_decimator_.Process(input); diar_remainder_.insert(diar_remainder_.end(), diar_down.begin(), diar_down.end()); while (diar_remainder_.size() >= static_cast<size_t>(vad_.Hop())) { std::vector<int16_t> d(diar_remainder_.begin(), diar_remainder_.begin() + vad_.Hop()); diar_remainder_.erase(diar_remainder_.begin(), diar_remainder_.begin() + vad_.Hop()); results_.AppendSessionSamples(d); } } enhance_remainder_.insert(enhance_remainder_.end(), input.begin(), input.end()); while (enhance_remainder_.size() >= kEnhanceHop) { std::array<int16_t, kEnhanceHop> hop{}; std::copy_n(enhance_remainder_.begin(), kEnhanceHop, hop.begin()); enhance_remainder_.erase(enhance_remainder_.begin(), enhance_remainder_.begin() + kEnhanceHop); auto output = enhancer_.Process(hop); std::vector<int16_t> rendered(output.begin(), output.end()); if (!monitor_queue_.TryPush(rendered)) { monitor_queue_.TryDropOldest(); monitor_queue_.TryPush(std::move(rendered)); } std::vector<int16_t> enhanced(output.begin(), output.end()); auto down = decimator_.Process(enhanced); vad_remainder_.insert(vad_remainder_.end(), down.begin(), down.end()); while (vad_remainder_.size() >= static_cast<size_t>(vad_.Hop())) { std::vector<int16_t> v(vad_remainder_.begin(), vad_remainder_.begin() + vad_.Hop()); vad_remainder_.erase(vad_remainder_.begin(), vad_remainder_.begin() + vad_.Hop()); if (BatchInput()) vad_jobs_.Push(std::move(v)); else if (!vad_jobs_.TryPush(v)) { vad_jobs_.TryDropOldest(); vad_jobs_.TryPush(std::move(v)); } } } }
   void VadLoop() { std::vector<int16_t> hop; while (vad_jobs_.Pop(&hop)) { bool voiced = true; try { voiced = vad_.Process(hop); } catch (const std::exception& e) { std::cerr << "[ten-vad] " << e.what() << "\n"; } accumulator_.Push(hop, voiced); } }
   void MonitorLoop() { std::vector<int16_t> hop; while (!g_stop.load() && monitor_queue_.Pop(&hop)) { playback_mixer_.Mix(&hop, config_.fastenhance.monitor_enabled); if (!WriteAll(child_.in, hop.data(), hop.size() * sizeof(int16_t))) break; } }
   bool BatchInput() const { return config_.runtime.input == "file" && config_.runtime.file_input_mode == "batch"; }
   static size_t monitor_queue_capacity(const apm_example::AppConfig& c) { return std::max<size_t>(2, static_cast<size_t>(c.buffers.application_buffer_ms) * kRateIn / 1000 / kEnhanceHop); }
-  apm_example::AppConfig config_; std::string config_path_; NpuArbiter arbiter_; Npu2CellArbiter npu2_arbiter_; PlaybackMixer playback_mixer_; ResultWorker results_; FastEnhance enhancer_; TenVad vad_; Decimator decimator_; Accumulator accumulator_; BlockingQueue<std::vector<int16_t>> vad_jobs_; BlockingQueue<std::vector<int16_t>> monitor_queue_; std::thread vad_thread_; std::vector<int16_t> enhance_remainder_, vad_remainder_; Child child_; bool closed_ = false;
+  apm_example::AppConfig config_; std::string config_path_; NpuArbiter arbiter_; Npu2CellArbiter npu2_arbiter_; PlaybackMixer playback_mixer_; ResultWorker results_; FastEnhance enhancer_; TenVad vad_; Decimator decimator_; Decimator diar_decimator_; Accumulator accumulator_; BlockingQueue<std::vector<int16_t>> vad_jobs_; BlockingQueue<std::vector<int16_t>> monitor_queue_; std::thread vad_thread_; std::vector<int16_t> enhance_remainder_, vad_remainder_, diar_remainder_; Child child_; bool closed_ = false;
 };
 
 }  // namespace

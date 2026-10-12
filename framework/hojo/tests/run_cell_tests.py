@@ -11,7 +11,7 @@ with tempfile.TemporaryDirectory(prefix='asr-cell-tests-') as directory:
     build = Path(directory)
     binary = build / 'cell-test'
     includes = ['framework', 'driver/ns/include', 'driver/vad/include',
-                'driver/asr/sensevoice/include', 'driver/campplus/include']
+                'driver/asr/sensevoice/include']
     subprocess.run(['g++', '-std=c++17', '-O1', '-g', '-ffunction-sections',
                     '-fdata-sections', *(f'-I{sdk / p}' for p in includes),
                     str(tests / 'cell_test.cpp'), '-Wl,--gc-sections',

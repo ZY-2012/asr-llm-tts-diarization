@@ -177,7 +177,7 @@ CXX=aarch64-linux-gnu-g++-11 \
 ./scripts/build.sh
 ```
 
-构建结束后确认五个生产产物齐全，且可执行文件均为 AArch64：
+构建结束后确认六个生产产物齐全，且可执行文件均为 AArch64：
 
 ```bash
 test -x build/audio-pipeline
@@ -185,7 +185,8 @@ test -x build/run-alsa-apm
 test -f build/libfastenhance.so
 test -x build/qwen3-worker
 test -x build/hojo-tts-resident
-file build/audio-pipeline build/run-alsa-apm build/qwen3-worker build/hojo-tts-resident
+test -x build/diar-worker
+file build/audio-pipeline build/run-alsa-apm build/qwen3-worker build/hojo-tts-resident build/diar-worker
 ```
 
 部署前还应检查运行库版本要求。下面输出中的最高版本不能高于板端提供的版本：
@@ -310,7 +311,7 @@ audio-pipeline（C++）
 | ASR | `driver/asr/sensevoice` + `libax_asr_api.so` | 管线通过共享库直接调用 SenseVoice，绑定 NPU2（BIG 双核）。 |
 | LLM | `driver/llm` + `models-for-asr-chain/llm/qwen3-1.7b` | 可选的 Qwen3-1.7B AX650/NPU2 worker。在当前 Cell 内处理 ASR 净文本，token 输出同时触发 Hojo CPU 预分词；worker 空闲时不卸载模型。 |
 | TTS | `driver/tts/hojo` + `models-for-asr-chain/tts/hojo` | 可选的 Hojo-TTS-Light-40M AX650/NPU2。按标点分段，提前缓存 tokenizer/embedding 结果，Qwen 结束后逐段推理并立即送入 ALSA 播放队列。 |
-| 说话人 | `driver/campplus` + `models-for-asr-chain/campplus/campplus.axmodel` | 可选的 AX650 NPU1 CAMPPlus 流式 embedding；每 0.75 s 采样一次，话段结束后聚类并持久化 SpeakerTable。VAD 拼接点用于净化跨拼接点的 embedding 窗口，并校正二次语音分割边界。 |
+| 说话人 | `driver/pyannote` + `build/diar-worker` + `models-for-asr-chain/pyannote/` | 可选的 AX650 NPU2 pyannote community-1 说话人日志：常驻 worker 一次性加载 8 个 axmodel，`mode: segment` 时段末对 16 kHz 话段 WAV 做整段推理（10 s 窗、`step_sec` 步长）；`mode: session` 时，文件批量输入在管线启动时先对源文件做一次整段推理，实时输入（ALSA 或 file realtime）则按 `session_chunk_sec` 分块流式推理，未覆盖的话段最多等待 `session_max_wait_sec` 秒后回退逐段。会话时间轴输出非重叠说话人区间，再按时间映射到每个 VAD 话段（说话人混淆显著低于逐段模式）。两种模式都按 256 维聚类中心与持久化 SpeakerTable 余弦匹配，跨段保持 `speaker-N` 编号。diarization 请求持有 NPU2 Cell 锁，不会与 SenseVoice/Qwen3/Hojo 抢核。 |
 | 配置 | `framework/configui`、`config/sdk-config.yaml` | 一个 YAML 配置源；页面保存采用临时文件和原子替换。`audio-pipeline` 解析全量配置，`run-alsa-apm` 只解析 `audio`、`buffers`、`apm` 和必要的 `runtime` 字段。 |
 
 AX Engine 以 `BIG_LITTLE`（2+1）模式初始化。FastEnhance 和 TEN-VAD 使用 affinity
@@ -354,6 +355,7 @@ APM 的 reverse stream。Hojo 的 24 kHz 单声道输出会转成 48 kHz；开�
 |    |--- apm/                         # 随 SDK 提供的 WebRTC APM 头文件/库
 |    |--- ns/                          # FastEnhance C API、源码和 NPU1 构建脚本
 |    |--- vad/                         # TEN-VAD 头文件和动态库
+|    |--- pyannote/                    # pyannote community-1 diar-worker 源码（MIT）
 |    |--- asr/
 |    |    |--- sensevoice/             # AX650 ASR 适配库和头文件
 |    |--- llm/                          # Qwen3 runner、常驻 worker 与 AX-LLM 源码
@@ -365,6 +367,7 @@ APM 的 reverse stream。Hojo 的 24 kHz 单声道输出会转成 48 kHz；开�
 |    |    |--- fastenhance/             # FastEnhance AXModel
 |    |--- vad/
 |    |    |--- ten-vad/                # TEN-VAD AXModel
+|    |--- pyannote/                    # community-1 分割/嵌入 AXModel 与主机参数
 |    |--- asr/
 |    |    |--- sensevoice/             # SenseVoice AXModel、词表和 tokenizer 资源
 |    |--- llm/
@@ -492,6 +495,7 @@ CXX=aarch64-none-linux-gnu-g++ \
 - `build/libfastenhance.so`
 - `build/qwen3-worker`
 - `build/hojo-tts-resident`
+- `build/diar-worker`
 
 FastEnhance 也可以单独重建：
 
@@ -508,8 +512,8 @@ CXX=aarch64-linux-gnu-g++ ./driver/ns/build-fastenhance.sh
 `scripts/deploy-ax650.sh` 只处理生产运行白名单，并用文件大小和 SHA-256 比较
 开发机与板端文件；已存在且内容相同的模型不会重复传输。变更文件先写入板端同目录
 的临时文件，校验成功后再原子替换，传输中断不会破坏原文件。部署完成后会在板端
-执行依赖检查。默认目标为 `root@10.126.29.50`，目标目录为
-`/root/wangzizhen/asr-chain`，均可通过环境变量覆盖：
+执行依赖检查。默认目标为 `root@<板端IP>`，目标目录为
+`/opt/ax-audio-sdk`，均可通过环境变量覆盖：
 
 ```bash
 TARGET=root@192.168.1.20 \
@@ -534,12 +538,15 @@ build/run-alsa-apm
 build/libfastenhance.so
 build/qwen3-worker
 build/hojo-tts-resident
+build/diar-worker
 driver/apm/lib/libwebrtc-audio-processing-2.so.1
 driver/vad/lib/libten_vad.so
 driver/asr/sensevoice/lib/libax_asr_api.so
 models-for-asr-chain/ns/fastenhance/fastenhance_48k.axmodel
 models-for-asr-chain/vad/ten-vad/ten-vad.axmodel
-models-for-asr-chain/campplus/campplus.axmodel
+models-for-asr-chain/pyannote/{segmentation_sincnet,segmentation_convs1,
+  segmentation_convs2,embedding_convs,lstm_cell_l0 ... lstm_cell_l3}.axmodel
+models-for-asr-chain/pyannote/{fbank,frontend,ffn,powerset,embtail,plda}.bin
 models-for-asr-chain/asr/sensevoice/{sensevoice.axmodel,tokens.txt,am.mvn,
   chn_jpn_yue_eng_ko_spectok.bpe.model}
 models-for-asr-chain/llm/qwen3-1.7b/{config.json,post_config.json,qwen3_tokenizer.txt,
@@ -647,7 +654,7 @@ runtime:
 | `apm` | `aec`、`ns`、`agc1`、`agc2`、`gain_adjustment` | WebRTC 前端处理。AEC 需要正确的播放参考和设备时延。 |
 | `fastenhance` | `enabled`、`model_path`、`library`、`monitor_enabled` | `library` 必须指向 `libfastenhance.so`；监听/扬声器回放由 `monitor_enabled` 控制。 |
 | `vad` | `library`、`model_path`、`hop_ms`、`threshold`、`min_speech_ms` | 控制语音判定和话段切分；`npu_core` 固定为 `0`。 |
-| `campplus` | `enabled`、`logging_enabled`、`model_path`、`min_cluster_size`、`merge_cosine`、`speaker_match_threshold` | 启用后按 1.5 s 窗口/0.75 s 步长提取 embedding，话段结束后统一使用 `merge_cosine` 进行凝聚式聚类，再与 `speaker_table_path` 中的长期说话人中心匹配。每个 WAV 同时生成 `<WAV文件名>.joins.txt`，记录 VAD 去除静音后各段语音的拼接点（16 kHz 样本索引和毫秒位置）。一个 embedding 窗口覆盖一个拼接点时，拼接点位于前半窗则清零其前部、位于后半窗则清零其后部；覆盖至少两个拼接点时，清零首个拼接点之前和最后一个拼接点之后的数据。聚类后的 speaker 变化边界吸附到最近的拼接点。`logging_enabled` 将聚类详情追加到 `/tmp/ax-audio-sdk/campplus.log`，不在终端打印。 |
+| `diarization` | `enabled`、`logging_enabled`、`mode`、`session_chunk_sec`、`session_max_wait_sec`、`runner`、`model_path`、`speaker_table_path`、`speaker_match_threshold`、`step_sec`、`omp_threads` | `mode: segment`（默认）在话段 WAV 落盘后交给 `build/diar-worker` 做整段说话人日志（10 s 窗、`step_sec` 步长的分割 + PLDA/VBx 聚类），再按 256 维聚类中心与 `speaker_table_path` 中的长期说话人库做余弦匹配，转录输出为 `speaker-N@时间 文本`；`mode: session` 时，`input: file` + `file_input_mode: batch` 在管线启动时先对源文件做一次整段推理（约 0.14 RTF，26 分钟音频约 4 分钟），实时输入（ALSA 或 file realtime）按 `session_chunk_sec` 秒分块流式推理并维护全局时间轴；未覆盖的话段最多等待 `session_max_wait_sec` 秒（0 表示立即回退逐段），等待期内标签质量和实时性可调，读取文件采样率并按 16 kHz 换算。匹配或推理失败时回退整段 ASR。每个 WAV 仍生成 `<WAV文件名>.joins.txt` 与 `.runs.txt`，记录 VAD 去除静音后各段语音的拼接点及拼接坐标到源坐标的映射，仅用于调试与评测。`speaker_match_threshold` 默认 0.55；部署的模型为 Pulsar2 `npu_mode: NPU2` 版本，详见 `driver/pyannote/README.md`。 |
 | `asr` | `library`、`runner`、`model_path`、`language` | SenseVoice 资源目录应指向 `models-for-asr-chain/asr`（适配器会追加 `sensevoice/`）；`npu_core` 固定为 `1`。`language` 支持 `auto`（自动识别）、`zh`（中文）、`en`（英文）、`yue`（粤语）、`ja`（日语）和 `ko`（韩语）。 |
 | `llm` | `enabled`、`model_path`、`system_prompt`、翻译模式、采样/惩罚参数 | `enabled` 是 ASR→LLM 总开关；支持中英互译、动态加载和内存保护、`max_tokens`、temperature/top-p/top-k、重复/频率/存在惩罚、思考模式、上下文重置和流式 token 回调。`queue_capacity` 控制待处理输入切片的 Cell FIFO，`0` 表示无界。 |
 | `hojo_tts` | `enabled`、中英文音色、`max_new_tokens`、`keep_wav`、`playback_gain` | `enabled` 是 LLM→TTS 总开关且要求同时启用 LLM。英文音色只能选择 `0–12`，中文音色只能选择 `13–14`；`queue_capacity` 控制 CPU 分段准备队列（`0` 为无界），`keep_wav` 控制是否保留合成文件到 `output_dir`。 |

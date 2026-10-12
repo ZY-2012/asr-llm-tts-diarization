@@ -241,14 +241,18 @@ bool ValidateAppConfig(const AppConfig& c, std::string* error) {
     *error = "VAD max accumulation must be greater than min accumulation plus trailing silence";
     return false;
   }
-  if (c.campplus.min_cluster_size < 0 ||
-      c.campplus.merge_cosine < -1.0f || c.campplus.merge_cosine > 1.0f ||
-      c.campplus.speaker_match_threshold < -1.0f ||
-      c.campplus.speaker_match_threshold > 1.0f ||
-      c.campplus.min_num_speakers < 1 ||
-      c.campplus.max_num_speakers < c.campplus.min_num_speakers ||
-      c.campplus.model_path.empty() || c.campplus.speaker_table_path.empty()) {
-    *error = "CampPlus clustering/model values are invalid";
+  if (c.diarization.speaker_match_threshold < -1.0f ||
+      c.diarization.speaker_match_threshold > 1.0f ||
+      c.diarization.step_sec <= 0.0f || c.diarization.step_sec > 10.0f ||
+      c.diarization.omp_threads < 1 || c.diarization.omp_threads > 64 ||
+      (c.diarization.mode != "segment" && c.diarization.mode != "session") ||
+      c.diarization.session_chunk_sec < 20.0f ||
+      c.diarization.session_chunk_sec > 600.0f ||
+      c.diarization.session_max_wait_sec < 0.0f ||
+      c.diarization.session_max_wait_sec > 900.0f ||
+      c.diarization.runner.empty() || c.diarization.model_path.empty() ||
+      c.diarization.speaker_table_path.empty()) {
+    *error = "Diarization worker/model values are invalid";
     return false;
   }
   if (c.output.max_mp3_storage_mb < 0 || c.asr.worker_threads <= 0) {
@@ -409,10 +413,12 @@ bool LoadAppConfig(const std::string& path,
       "vad.input_buffer_ms", "vad.hop_ms", "vad.threshold", "vad.min_speech_ms",
       "vad.min_segment_seconds", "vad.max_segment_seconds",
       "vad.trailing_silence_seconds",
-      "campplus.enabled", "campplus.logging_enabled", "campplus.model_path",
-      "campplus.speaker_table_path", "campplus.min_cluster_size",
-      "campplus.merge_cosine", "campplus.min_num_speakers",
-      "campplus.max_num_speakers", "campplus.speaker_match_threshold",
+      "diarization.enabled", "diarization.logging_enabled",
+      "diarization.mode",
+      "diarization.runner", "diarization.model_path",
+      "diarization.speaker_table_path", "diarization.speaker_match_threshold",
+      "diarization.step_sec", "diarization.omp_threads",
+      "diarization.session_chunk_sec", "diarization.session_max_wait_sec",
       "asr.enabled", "asr.model_path", "asr.model_type", "asr.language",
       "asr.library", "asr.npu_core", "asr.worker_threads",
       "llm.enabled", "llm.model_path", "llm.runner", "llm.system_prompt",
@@ -502,15 +508,17 @@ bool LoadAppConfig(const std::string& path,
   GET_NUM("vad.min_segment_seconds", c->vad.min_segment_seconds);
   GET_NUM("vad.max_segment_seconds", c->vad.max_segment_seconds);
   GET_NUM("vad.trailing_silence_seconds", c->vad.trailing_silence_seconds);
-  GET_BOOL("campplus.enabled", c->campplus.enabled);
-  GET_BOOL("campplus.logging_enabled", c->campplus.logging_enabled);
-  GET_STRING("campplus.model_path", c->campplus.model_path);
-  GET_STRING("campplus.speaker_table_path", c->campplus.speaker_table_path);
-  GET_NUM("campplus.min_cluster_size", c->campplus.min_cluster_size);
-  GET_NUM("campplus.merge_cosine", c->campplus.merge_cosine);
-  GET_NUM("campplus.min_num_speakers", c->campplus.min_num_speakers);
-  GET_NUM("campplus.max_num_speakers", c->campplus.max_num_speakers);
-  GET_NUM("campplus.speaker_match_threshold", c->campplus.speaker_match_threshold);
+  GET_BOOL("diarization.enabled", c->diarization.enabled);
+  GET_BOOL("diarization.logging_enabled", c->diarization.logging_enabled);
+  GET_STRING("diarization.mode", c->diarization.mode);
+  GET_STRING("diarization.runner", c->diarization.runner);
+  GET_STRING("diarization.model_path", c->diarization.model_path);
+  GET_STRING("diarization.speaker_table_path", c->diarization.speaker_table_path);
+  GET_NUM("diarization.speaker_match_threshold", c->diarization.speaker_match_threshold);
+  GET_NUM("diarization.step_sec", c->diarization.step_sec);
+  GET_NUM("diarization.omp_threads", c->diarization.omp_threads);
+  GET_NUM("diarization.session_chunk_sec", c->diarization.session_chunk_sec);
+  GET_NUM("diarization.session_max_wait_sec", c->diarization.session_max_wait_sec);
   GET_BOOL("asr.enabled", c->asr.enabled);
   GET_STRING("asr.model_path", c->asr.model_path);
   GET_STRING("asr.model_type", c->asr.model_type);

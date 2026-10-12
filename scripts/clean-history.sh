@@ -11,7 +11,7 @@ fi
 
 # The board cleanup path is intentionally dependency-free. sdk-config.yaml is
 # a restricted flat mapping, so extract output files/directories (including
-# Qwen3 and Hojo) and the persistent CampPlus speaker table path in awk.
+# Qwen3 and Hojo) and the persistent speaker table path in awk.
 PATHS_TEXT="$(awk '
   /^[[:space:]]*mp3_dir:[[:space:]]*/ {v=$0; sub(/^[^:]*:[[:space:]]*/,"",v); print v}
   /^[[:space:]]*temp_dir:[[:space:]]*/ {v=$0; sub(/^[^:]*:[[:space:]]*/,"",v); print v}
@@ -24,10 +24,6 @@ PATHS_TEXT="$(awk '
   case "${path}" in ~/*) path="${HOME}/${path#~/}";; esac
   readlink -m -- "${path}"
 done)"
-
-# CampPlus detailed clustering logs use a fixed path so they remain separate
-# from transcript output while still participating in history cleanup.
-PATHS_TEXT+=$'\n/tmp/ax-audio-sdk/campplus.log'
 
 mapfile -t HISTORY_PATHS <<< "${PATHS_TEXT}"
 
