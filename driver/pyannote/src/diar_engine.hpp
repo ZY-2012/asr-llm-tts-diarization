@@ -172,6 +172,11 @@ class DiarEngine {
     static CacheKey HashSubWindow(const float* win);
     std::size_t CacheSize() const { return subwin_cache_.size(); }
 
+    // Resets the incremental-clustering state (running speaker centroids) so a
+    // new session starts from an empty speaker set.  Streaming callers drive
+    // Run() sub-window-at-a-time and must call this once per session.
+    void ResetIncremental();
+
  private:
     Params P;
     EngineWrapper seg_a, seg_b1, seg_b2, cells[4], emb;
@@ -197,6 +202,12 @@ class DiarEngine {
                             int C, std::vector<int>& hard_clusters, int& K,
                             std::vector<float>* centroids_out,
                             const IncrementalParams& p);
+
+    // Incremental-clustering running state: feature-space (matching) and
+    // raw-space (output) accumulated centroids.  Persists across Run() calls
+    // so a streaming caller can submit sub-windows one at a time; cleared by
+    // ResetIncremental().
+    std::vector<std::vector<double>> inc_fc_, inc_rc_;
 
     // sub-window cache (see SubWinCache above); insertion-ordered for FIFO
     // eviction, since sliding windows advance and old entries stop being hit.

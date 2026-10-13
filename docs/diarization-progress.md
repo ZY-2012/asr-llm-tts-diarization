@@ -217,9 +217,18 @@ delta_new/rho_update/tau_active/max_speakers），`Run()` 加 `incremental` 参�
 （0.40%/20.04%）逐位一致（差异为 RTTM 3 位小数舍入）。原型脚本固化到
 `driver/pyannote/tools/incremental_proto/`（含 README + score_der.py）。
 
-**下一步（真正首标签 ~11s 的流式落地）**：oneshot 已验证增量聚类质量；首标签提速
-仍需 audio_pipeline 改为**逐 10s 子窗提交**（而非 120s 整窗缓冲），并把增量质心状态
-提升为 engine 跨请求成员（类比 `speaker_table` 的在线状态），冷启动从第 1 子窗即出标签。
+**流式落地（2026-10-14 完成，首标签 ~10s）**：增量质心状态（`inc_fc_/inc_rc_`）
+提升为 engine 跨请求成员 + `ResetIncremental()`；`diar_worker` 流式循环支持逐子窗
+提交（空请求 = session 边界，重置增量状态 + `speaker_table.Clear()`）。板端实测
+逐 10s 子窗提交：**首标签推理延迟 0.24s**（端到端首标签 ≈ 10s 音频缓冲 + 0.24s ≈
+**10.2s**，vs 132.3s 提前 ~13 倍）；第 1 子窗即正确发现 2 人并捕捉说话人切换，
+增量状态跨子窗零幻影/漂移（全程 speaker-1×112 / speaker-2×173）。
+注：流式响应为 `parts`（每子窗独立 partition、覆盖含静音），其 conf 3.42% 系
+partition 边界断裂的口径假象；聚类质量本身与 oneshot 等价（rttm 口径 conf 0.39%）。
+
+**下一步（可选）**：audio_pipeline 集成逐 10s 子窗提交（替换 120s 整窗缓冲）即可
+把冷启动首标签从 132.3s 降到 ~10s；多说话人场景可开 `--incremental-plda`（delta_new
+0.55 三场景统一），或探索自适应 delta_new。
 
 ## 3. 已完成的工作
 

@@ -374,12 +374,29 @@ int main(int argc, char** argv) {
 
         if (!options.dump_features.empty())
             return RunDumpFeatures(&engine, options);
-        if (options.oneshot) return RunOneshot(&engine, &table, options);
+        if (options.oneshot) {
+            // One-shot analyses a whole session in one Run() call; start from
+            // an empty incremental speaker set.
+            engine.ResetIncremental();
+            return RunOneshot(&engine, &table, options);
+        }
+        // Streaming loop: sub-window-at-a-time requests keep the incremental
+        // clustering state across calls (see --incremental).  A session reset
+        // is signalled by an empty request (size 0 below).
+        if (options.incremental) engine.ResetIncremental();
         if (!WriteFrame(response_fd, 'R', "ready")) return 1;
 
         uint32_t request_size = 0;
         while (ReadAll(STDIN_FILENO, &request_size, sizeof(request_size))) {
-            if (request_size == 0 || request_size > 64U * 1024U) {
+            if (request_size == 0) {
+                // Empty request = session boundary: reset the incremental
+                // clustering state and the persistent speaker table.
+                if (options.incremental) engine.ResetIncremental();
+                table.Clear();
+                if (!WriteFrame(response_fd, 'R', "reset")) break;
+                continue;
+            }
+            if (request_size > 64U * 1024U) {
                 if (!WriteFrame(response_fd, 'E', "invalid request size")) break;
                 continue;
             }

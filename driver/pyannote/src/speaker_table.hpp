@@ -63,6 +63,8 @@ class SpeakerTable {
 
     std::size_t size() const { return speakers_.size(); }
     const std::vector<Speaker>& speakers() const { return speakers_; }
+    // Drops all speakers (session boundary), restarting id allocation at 1.
+    void Clear() { speakers_.clear(); next_id_ = 1; }
 
  private:
     std::vector<Speaker> speakers_;

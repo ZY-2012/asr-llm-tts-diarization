@@ -630,9 +630,9 @@ void DiarEngine::ClusterIncremental(std::vector<float>& embs,
         }
     }
 
-    // Running global centroids: feature space for matching, raw space for the
-    // centroids_out handed to the persistent speaker table.
-    std::vector<std::vector<double>> fc, rc;
+    // Running global centroids live in the members inc_fc_ / inc_rc_ so a
+    // streaming caller can submit sub-windows one at a time and the state
+    // persists across Run() calls (see ResetIncremental).
 
     hard_clusters.assign((size_t)C * 3, -1);
 
@@ -658,13 +658,13 @@ void DiarEngine::ClusterIncremental(std::vector<float>& embs,
         }
 
         int assign[3] = {-1, -1, -1};
-        if (fc.empty()) {
+        if (inc_fc_.empty()) {
             for (int s : al) {
-                int g = (int)fc.size();
+                int g = (int)inc_fc_.size();
                 const double* f = feats.data() + (size_t)(c * 3 + s) * PD;
                 const float* e = embs.data() + (size_t)(c * 3 + s) * D;
-                fc.push_back(std::vector<double>(f, f + PD));
-                rc.push_back(std::vector<double>(e, e + D));
+                inc_fc_.push_back(std::vector<double>(f, f + PD));
+                inc_rc_.push_back(std::vector<double>(e, e + D));
                 assign[s] = g;
             }
         } else {
@@ -672,8 +672,8 @@ void DiarEngine::ClusterIncremental(std::vector<float>& embs,
                 const double* f = feats.data() + (size_t)(c * 3 + s) * PD;
                 int bg = -1;
                 double bd = 1e30;
-                for (int g = 0; g < (int)fc.size(); ++g) {
-                    double d = cosd(f, fc[g].data(), PD);
+                for (int g = 0; g < (int)inc_fc_.size(); ++g) {
+                    double d = cosd(f, inc_fc_[g].data(), PD);
                     if (d < bd) { bd = d; bg = g; }
                 }
                 if (bg >= 0 && bd <= p.delta_new) assign[s] = bg;
@@ -681,19 +681,19 @@ void DiarEngine::ClusterIncremental(std::vector<float>& embs,
             for (int s : al) {
                 if (assign[s] >= 0) continue;
                 bool is_long = std::find(ll.begin(), ll.end(), s) != ll.end();
-                if ((int)fc.size() < p.max_speakers && is_long) {
-                    int g = (int)fc.size();
+                if ((int)inc_fc_.size() < p.max_speakers && is_long) {
+                    int g = (int)inc_fc_.size();
                     const double* f = feats.data() + (size_t)(c * 3 + s) * PD;
                     const float* e = embs.data() + (size_t)(c * 3 + s) * D;
-                    fc.push_back(std::vector<double>(f, f + PD));
-                    rc.push_back(std::vector<double>(e, e + D));
+                    inc_fc_.push_back(std::vector<double>(f, f + PD));
+                    inc_rc_.push_back(std::vector<double>(e, e + D));
                     assign[s] = g;
-                } else if (!fc.empty()) {
+                } else if (!inc_fc_.empty()) {
                     const double* f = feats.data() + (size_t)(c * 3 + s) * PD;
                     int bg = 0;
                     double bd = 1e30;
-                    for (int g = 0; g < (int)fc.size(); ++g) {
-                        double d = cosd(f, fc[g].data(), PD);
+                    for (int g = 0; g < (int)inc_fc_.size(); ++g) {
+                        double d = cosd(f, inc_fc_[g].data(), PD);
                         if (d < bd) { bd = d; bg = g; }
                     }
                     assign[s] = bg;
@@ -703,25 +703,30 @@ void DiarEngine::ClusterIncremental(std::vector<float>& embs,
                 if (assign[s] < 0) continue;
                 const double* f = feats.data() + (size_t)(c * 3 + s) * PD;
                 const float* e = embs.data() + (size_t)(c * 3 + s) * D;
-                for (int d = 0; d < PD; ++d) fc[assign[s]][d] += f[d];
-                for (int d = 0; d < D; ++d) rc[assign[s]][d] += e[d];
+                for (int d = 0; d < PD; ++d) inc_fc_[assign[s]][d] += f[d];
+                for (int d = 0; d < D; ++d) inc_rc_[assign[s]][d] += e[d];
             }
         }
 
         for (int s = 0; s < 3; ++s) hard_clusters[c * 3 + s] = assign[s];
     }
 
-    K = (int)fc.size();
+    K = (int)inc_fc_.size();
     if (centroids_out && K > 0) {
         centroids_out->assign((size_t)K * D, 0.0f);
         for (int g = 0; g < K; ++g) {
             double n = 0;
-            for (int d = 0; d < D; ++d) n += rc[g][d] * rc[g][d];
+            for (int d = 0; d < D; ++d) n += inc_rc_[g][d] * inc_rc_[g][d];
             n = std::sqrt(n) + 1e-30;
             for (int d = 0; d < D; ++d)
-                (*centroids_out)[(size_t)g * D + d] = (float)(rc[g][d] / n);
+                (*centroids_out)[(size_t)g * D + d] = (float)(inc_rc_[g][d] / n);
         }
     }
+}
+
+void DiarEngine::ResetIncremental() {
+    inc_fc_.clear();
+    inc_rc_.clear();
 }
 
 // ---------------------------------------------------------------------------
