@@ -87,7 +87,7 @@ struct AppConfig {
     // shared config is also parsed by run-alsa-apm.
     int input_buffer_ms = 1000;
     int hop_ms = 16;
-    float threshold = 0.5f;
+    float threshold = 0.3f;
     int min_speech_ms = 100;
     // A segment starts checking trailing silence only after this much audio.
     float min_segment_seconds = 3.0f;
@@ -131,6 +131,13 @@ struct AppConfig {
     // label latency drops to ~step + inference while the clustering context
     // stays a full chunk long.
     float session_step_sec = 0.0f;
+    // Cold-start ramp-up (0 = off, first commit waits a full chunk).  With
+    // 0 < session_first_window_sec < session_chunk_sec the very first commit
+    // clusters only that much audio, so the session's opening labels appear
+    // after ~first_window + inference instead of a whole chunk; every later
+    // commit keeps the full `session_chunk_sec` context, which is why only
+    // the opening region is clustered from a short window.
+    float session_first_window_sec = 0.0f;
     // How long a segment may wait for the session timeline to cover it before
     // falling back to per-segment diarization (0 = never wait).
     float session_max_wait_sec = 180.0f;

@@ -621,7 +621,7 @@ bool WriteParts(const fs::path& wav, const std::vector<Segment::Part>& parts) {
 // P2 part cleanup (docs/diarization-progress.md): sliding-window commits cut
 // a continuous speech region at every core boundary and speaker changes cut
 // the stream into many small parts, each of which becomes one ASR request
-// (hence junk "。"-only or empty transcript lines).  (A) adjacent parts with
+// (hence junk "。-only" or empty transcript lines).  (A) adjacent parts with
 // the same speaker are re-joined — the samples and their speaker are
 // unchanged, only the arbitrary split disappears; (B) parts shorter than
 // kMinPartSamples are absorbed into the longer neighbour — speaker
@@ -629,6 +629,19 @@ bool WriteParts(const fs::path& wav, const std::vector<Segment::Part>& parts) {
 // 418 -> 236 parts, v8 agreement 91.6% -> 91.5%; T3 conf is unchanged up to
 // 0.3 s and degrades beyond it (threshold sweep in the eval assets).
 constexpr std::size_t kMinPartSamples = kRateOut * 3 / 10;  // 0.3 s
+
+// P2c ASR slice pad: a part boundary that lands inside a word onset leaves the
+// ASR with the tail of the word only.  In the 2P run the second turn was cut
+// at source 2.080 s, about 20 ms into the "可" burst (rms 823 at 2.06 s), and
+// the whole "可以听到。" came back as "以。" (run-pad-experiment.sh).  Replaying
+// every recorded part of the run with and without the pad (run-pad-replay.sh)
+// changes 47 of 236 part texts, including that one ("以。" -> "可以听。"); the
+// net character gain over the session is small (~11 chars on 5.6k), so this
+// fixes the visible headless-word cases rather than the bulk of the
+// dropped-character volume.  Timestamps, parts.txt and the RTTM keep the
+// unpadded bounds — only the ASR input grows, so labeling and DER scoring are
+// unaffected.
+constexpr std::size_t kAsrPadSamples = kRateOut / 5;  // 0.2 s
 
 std::vector<Segment::Part> MapTimelineToTrimmed(
     const std::vector<Segment::Part>& timeline,
@@ -1943,13 +1956,21 @@ class SessionDiarizer {
   // timeline (diart-style decoupling: label latency ~ step + inference while
   // the clustering context stays a full chunk long).  The very first window
   // commits in full so speaker discovery bootstraps with the whole context.
-  SessionDiarizer(double chunk_sec, double step_sec)
+  // `first_window_sec` (0 = off, must be < chunk_sec) shortens that very first
+  // commit only: with it set, the opening labels land after ~first_window +
+  // inference instead of a whole chunk, and every later commit still clusters
+  // a full chunk of context.
+  SessionDiarizer(double chunk_sec, double step_sec, double first_window_sec)
       : window_samples_(static_cast<std::size_t>(
             std::max(1.0, chunk_sec) * kRateOut)),
         step_samples_(static_cast<std::size_t>(
-            std::max(0.0, step_sec) * kRateOut)) {
+            std::max(0.0, step_sec) * kRateOut)),
+        first_window_samples_(static_cast<std::size_t>(
+            std::max(0.0, first_window_sec) * kRateOut)) {
     if (step_samples_ == 0 || step_samples_ >= window_samples_)
       step_samples_ = window_samples_;  // legacy: commit per full chunk
+    if (first_window_samples_ == 0 || first_window_samples_ >= window_samples_)
+      first_window_samples_ = window_samples_;
   }
   ~SessionDiarizer() { Stop(); }
 
@@ -2042,7 +2063,8 @@ class SessionDiarizer {
  private:
   // Absolute source position the frontier must reach before the next commit.
   std::size_t NeedNoLock() const {
-    if (committed_ == 0) return window_samples_;  // cold start: full window
+    // Cold start: a full window unless the ramp-up first window is enabled.
+    if (committed_ == 0) return first_window_samples_;
     return committed_ + step_samples_;
   }
 
@@ -2139,6 +2161,7 @@ class SessionDiarizer {
 
   std::size_t window_samples_;          // clustering context (analysis window)
   std::size_t step_samples_;            // commit step (== window: legacy)
+  std::size_t first_window_samples_;    // ramp-up first commit (== window: off)
   DiarWorker* worker_ = nullptr;
   std::string work_dir_;
   mutable std::mutex mutex_;
@@ -2237,13 +2260,18 @@ class ResultWorker {
           "Speaker diarization is enabled but its worker is unavailable");
     if (streaming_session) {
       session_ = std::make_unique<SessionDiarizer>(
-          c_.diarization.session_chunk_sec, c_.diarization.session_step_sec);
+          c_.diarization.session_chunk_sec, c_.diarization.session_step_sec,
+          c_.diarization.session_first_window_sec);
       session_->Start(&diarrer_, c_.output.temp_dir);
       std::cerr << "[diar] streaming session diarization mode="
                 << c_.diarization.mode << " chunk="
                 << c_.diarization.session_chunk_sec << "s step="
                 << (c_.diarization.session_step_sec > 0.0f
                         ? c_.diarization.session_step_sec
+                        : c_.diarization.session_chunk_sec)
+                << "s first_win="
+                << (c_.diarization.session_first_window_sec > 0.0f
+                        ? c_.diarization.session_first_window_sec
                         : c_.diarization.session_chunk_sec)
                 << "s max_wait=" << c_.diarization.session_max_wait_sec
                 << "s\n";
@@ -2356,13 +2384,20 @@ class ResultWorker {
       } else {
         // Speaker parts are ASR-only slices.  The original VAD WAV below is
         // still the sole input to MP3 encoding, so speaker labeling cannot
-        // change the established audio archival behavior.
+        // change the established audio archival behavior.  Each slice reaches
+        // back by kAsrPadSamples so a boundary that fell inside a word onset
+        // does not hand the ASR a headless word; see kAsrPadSamples.  The reach
+        // deliberately overlaps the previous part's tail — the clipped onset
+        // samples live there — and 0.2 s is short enough not to pull the
+        // previous speaker's words into the transcript.
         for (std::size_t i = 0; i < s.parts.size(); ++i) {
           const auto& part = s.parts[i];
           const std::size_t begin = std::min(part.begin, s.samples.size());
           const std::size_t end = std::min(std::max(part.end, begin), s.samples.size());
           if (end <= begin) continue;
-          std::vector<int16_t> pcm(s.samples.begin() + begin, s.samples.begin() + end);
+          const std::size_t slice_begin =
+              begin > kAsrPadSamples ? begin - kAsrPadSamples : 0;
+          std::vector<int16_t> pcm(s.samples.begin() + slice_begin, s.samples.begin() + end);
           const auto part_start = s.wall_start + std::chrono::milliseconds(static_cast<int64_t>(begin) * 1000 / kRateOut);
           const fs::path part_wav = fs::path(c_.output.temp_dir) / (stamp + "." + std::to_string(i) + ".wav");
           if (!WriteWav(part_wav, pcm, kRateOut)) continue;

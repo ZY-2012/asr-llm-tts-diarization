@@ -55,7 +55,7 @@ vad:
   npu_core: 0
   input_buffer_ms: 2000
   hop_ms: 16
-  threshold: 0.5
+  threshold: 0.3
   min_speech_ms: 615
   min_segment_seconds: 1.0
   max_segment_seconds: 30.0

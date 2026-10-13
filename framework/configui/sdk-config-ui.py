@@ -106,7 +106,7 @@ def _controls_from_config(config: dict[str, Any]) -> tuple[Any, ...]:
         _value(config, "vad", "enabled", default=True),
         _value(config, "vad", "library", default="driver/vad/lib/libten_vad.so"),
         _value(config, "vad", "model_path", default="models-for-asr-chain/vad/ten-vad/ten-vad.axmodel"),
-        _value(config, "vad", "threshold", default=0.5),
+        _value(config, "vad", "threshold", default=0.3),
         _value(config, "vad", "min_speech_ms", default=100),
         _value(config, "vad", "min_segment_seconds", default=3),
         _value(config, "vad", "max_segment_seconds", default=30),
@@ -169,6 +169,7 @@ def _controls_from_config(config: dict[str, Any]) -> tuple[Any, ...]:
         _value(config, "diarization", "mode", default="segment"),
         _value(config, "diarization", "session_chunk_sec", default=120.0),
         _value(config, "diarization", "session_step_sec", default=0.0),
+        _value(config, "diarization", "session_first_window_sec", default=0.0),
         _value(config, "diarization", "session_max_wait_sec", default=180.0),
         _value(config, "diarization", "online_min_new_speech_sec", default=2.0),
         _value(config, "diarization", "online_update_min_sec", default=1.0),
@@ -257,7 +258,7 @@ def build_ui(config_path: Path, apm_port: int = 7861) -> gr.Blocks:
             vad_enabled = gr.Checkbox(label="启用 TEN-VAD", value=_value(initial, "vad", "enabled", default=True))
             vad_library = gr.Textbox(label="TEN-VAD 动态库", value=_value(initial, "vad", "library", default="driver/vad/lib/libten_vad.so"))
             vad_model = gr.Textbox(label="TEN-VAD 模型", value=_value(initial, "vad", "model_path", default="models-for-asr-chain/vad/ten-vad/ten-vad.axmodel"))
-            vad_threshold = gr.Slider(0, 1, step=0.01, label="VAD 阈值", value=_value(initial, "vad", "threshold", default=0.5))
+            vad_threshold = gr.Slider(0, 1, step=0.01, label="VAD 阈值", value=_value(initial, "vad", "threshold", default=0.3))
             with gr.Row():
                 min_speech = gr.Number(label="最短语音 (ms)", value=_value(initial, "vad", "min_speech_ms", default=100), precision=0)
                 min_segment = gr.Number(label="最短累积 (s)", value=_value(initial, "vad", "min_segment_seconds", default=3))
@@ -282,6 +283,7 @@ def build_ui(config_path: Path, apm_port: int = 7861) -> gr.Blocks:
             with gr.Row():
                 diarization_chunk = gr.Number(label="流式分块长度（s）", value=_value(initial, "diarization", "session_chunk_sec", default=120.0))
                 diarization_step_commit = gr.Number(label="流式提交步长（s，0=每块整提交）", value=_value(initial, "diarization", "session_step_sec", default=0.0), info="0<步长<分块长度时启用滑窗提交：每步长秒只提交新增区间，聚类窗口仍为整块长度，标签延迟≈步长+推理，精度保持。")
+                diarization_first_window = gr.Number(label="冷启动首窗（s，0=等满整块）", value=_value(initial, "diarization", "session_first_window_sec", default=0.0), info="会话开头单独用较短窗口聚类一次，让首标签在 ~首窗+推理 后出现，而不是等满整块；后续每次提交仍用整块上下文，因此只有开头区间是用短窗聚类的。")
                 diarization_wait = gr.Number(label="标签最长等待（s，0=立即回退）", value=_value(initial, "diarization", "session_max_wait_sec", default=180.0))
             with gr.Row():
                 online_min_new = gr.Number(label="online：新建说话人所需语音（s）", value=_value(initial, "diarization", "online_min_new_speech_sec", default=2.0))
@@ -404,6 +406,7 @@ def build_ui(config_path: Path, apm_port: int = 7861) -> gr.Blocks:
                     hojo_gain, hojo_npu_core,
                     input_source, input_wav, file_input_mode,
                     diarization_mode, diarization_chunk, diarization_step_commit,
+                    diarization_first_window,
                     diarization_wait, online_min_new, online_update_min,
                     online_max_speakers]
 
@@ -441,15 +444,18 @@ def build_ui(config_path: Path, apm_port: int = 7861) -> gr.Blocks:
                 raise gr.Error("说话人分割滑动步长必须在 (0, 10] 秒")
             if not 1 <= diarization["omp_threads"] <= 64:
                 raise gr.Error("说话人分离 OpenMP 线程数必须在 [1, 64]")
-            diarization["mode"] = str(values[-7]).strip() or "segment"
+            diarization["mode"] = str(values[-8]).strip() or "segment"
             if diarization["mode"] not in ("segment", "session", "online"):
                 raise gr.Error("说话人分离模式必须是 segment、session 或 online")
-            diarization["session_chunk_sec"] = float(values[-6])
+            diarization["session_chunk_sec"] = float(values[-7])
             if not 20 <= diarization["session_chunk_sec"] <= 600:
                 raise gr.Error("流式分块长度必须在 [20, 600] 秒")
-            diarization["session_step_sec"] = float(values[-5])
+            diarization["session_step_sec"] = float(values[-6])
             if not 0 <= diarization["session_step_sec"] <= diarization["session_chunk_sec"]:
                 raise gr.Error("流式提交步长必须在 [0, 分块长度] 秒")
+            diarization["session_first_window_sec"] = float(values[-5])
+            if not 0 <= diarization["session_first_window_sec"] < diarization["session_chunk_sec"]:
+                raise gr.Error("冷启动首窗必须在 [0, 分块长度) 秒")
             diarization["session_max_wait_sec"] = float(values[-4])
             if not 0 <= diarization["session_max_wait_sec"] <= 900:
                 raise gr.Error("标签最长等待必须在 [0, 900] 秒")
