@@ -12,6 +12,44 @@ extern double g_t_unfold, g_t_norm, g_t_ffn, g_t_cells, g_t_npu_other;
 static const double PI = 3.14159265358979323846;
 
 // ---------------------------------------------------------------------------
+// sub-window cache (see header).  Keys are content hashes of the 10 s of
+// samples; identical content in the overlap of consecutive sliding windows
+// yields identical masks/embeddings, so serving from cache is bit-identical.
+// ---------------------------------------------------------------------------
+DiarEngine::CacheKey DiarEngine::HashSubWindow(const float* win) {
+    // FNV-1a over the 16-bit linear view of the window, 4 samples (16 bytes)
+    // per round to keep hashing cheap (~15 us for 10 s @ 16 kHz).
+    std::uint64_t h = 1469598103934665603ULL;
+    const int n_short = WINDOW_SAMPLES & ~3;
+    const std::int16_t* v = reinterpret_cast<const std::int16_t*>(win);
+    for (int i = 0; i < n_short * 2; i += 8) {
+        for (int j = 0; j < 8; ++j)
+            h = (h ^ (std::uint64_t)(std::uint16_t)v[i + j]) * 1099511628211ULL;
+    }
+    return h;
+}
+
+const DiarEngine::SubWinCache* DiarEngine::CacheGet(CacheKey key) {
+    auto it = subwin_cache_.find(key);
+    return it == subwin_cache_.end() ? nullptr : &it->second;
+}
+
+void DiarEngine::CachePut(CacheKey key, SubWinCache&& entry) {
+    auto it = subwin_cache_.find(key);
+    if (it != subwin_cache_.end()) {
+        it->second = std::move(entry);
+        return;
+    }
+    if (subwin_cache_order_.size() >= kCacheMaxEntries) {
+        subwin_cache_.erase(subwin_cache_order_.front());
+        subwin_cache_order_.pop_front();
+    }
+    subwin_cache_.emplace(key, std::move(entry));
+    subwin_cache_order_.push_back(key);
+}
+
+
+// ---------------------------------------------------------------------------
 // segmentation: one 10s window -> hard 3-speaker masks (589, 3)
 // ---------------------------------------------------------------------------
 void DiarEngine::SegmentWindow(const float* win, uint8_t* masks) {
@@ -161,7 +199,8 @@ void DiarEngine::SegmentWindow(const float* win, uint8_t* masks) {
 // embeddings
 // ---------------------------------------------------------------------------
 void DiarEngine::Embeddings(const WavData& wav, const std::vector<uint8_t>& seg_data,
-                            int C, std::vector<float>& embs) {
+                            int C, std::vector<float>& embs,
+                            const std::vector<const SubWinCache*>& cached) {
     embs.assign((size_t)C * 3 * EMB_DIM, 0.0f);
     if (buf_fbank.empty()) buf_fbank.resize(998 * 80);
     static std::vector<float> crop, frames, x, wi, stats, e, cmask, used;
@@ -175,6 +214,12 @@ void DiarEngine::Embeddings(const WavData& wav, const std::vector<uint8_t>& seg_
     used.resize(SEG_FRAMES);
 
     for (int c = 0; c < C; ++c) {
+        // Cache hit: all three speaker embeddings are already final.
+        if (c < (int)cached.size() && cached[c]) {
+            memcpy(embs.data() + (size_t)c * 3 * EMB_DIM,
+                   cached[c]->embs.data(), 3 * EMB_DIM * sizeof(float));
+            continue;
+        }
         int s0 = (int)(c * step_sec_ * SAMPLE_RATE);
         memset(crop.data(), 0, WINDOW_SAMPLES * sizeof(float));
         int avail = std::min(WINDOW_SAMPLES, (int)wav.samples.size() - s0);
@@ -548,7 +593,8 @@ void DiarEngine::Run(const WavData& wav, float step_sec,
                      std::vector<Segment>& rttm,
                      std::vector<Part>* parts,
                      std::vector<float>* centroids,
-                     int* num_clusters) {
+                     int* num_clusters,
+                     int* cache_hits) {
     step_sec_ = step_sec;
 
     const int step_samples = (int)(step_sec * SAMPLE_RATE);
@@ -560,14 +606,29 @@ void DiarEngine::Run(const WavData& wav, float step_sec,
 
     std::vector<uint8_t> seg_data((size_t)C * 589 * 3, 0);
     std::vector<float> win(WINDOW_SAMPLES);
+    std::vector<const SubWinCache*> cached(C, nullptr);
+    std::vector<CacheKey> keys(C, 0);
+    int hits = 0;
     for (int c = 0; c < C; ++c) {
         int s0 = c * step_samples;
         memset(win.data(), 0, WINDOW_SAMPLES * sizeof(float));
         int avail = std::min(WINDOW_SAMPLES, n - s0);
         if (avail > 0) memcpy(win.data(), wav.samples.data() + s0, avail * sizeof(float));
+        // Only full (unpadded) sub-windows are cacheable: their result is a
+        // pure function of the 10 s of samples.
+        if (avail == WINDOW_SAMPLES) {
+            keys[c] = HashSubWindow(win.data());
+            if (const SubWinCache* hit = CacheGet(keys[c])) {
+                memcpy(seg_data.data() + (size_t)c * 589 * 3, hit->masks.data(),
+                       (size_t)589 * 3);
+                cached[c] = hit;
+                ++hits;
+                continue;
+            }
+        }
         SegmentWindow(win.data(), seg_data.data() + (size_t)c * 589 * 3);
     }
-
+    if (cache_hits) *cache_hits = hits;
 
     float t_end = 10.0f + (C - 1) * step_sec + 0.5f * FRAME_DUR;
     int T = closest_frame(t_end) + 1;
@@ -598,7 +659,22 @@ void DiarEngine::Run(const WavData& wav, float step_sec,
     }
 
     std::vector<float> embs;
-    Embeddings(wav, seg_data, C, embs);
+    Embeddings(wav, seg_data, C, embs, cached);
+
+    // Store newly computed full sub-windows for the next sliding window.
+    // Skipped when the request degenerated before embeddings ran (embs
+    // empty); those windows simply recompute next time.
+    if (embs.size() == (size_t)C * 3 * EMB_DIM) {
+        for (int c = 0; c < C; ++c) {
+            if (cached[c] || keys[c] == 0) continue;
+            SubWinCache entry;
+            entry.masks.assign(seg_data.data() + (size_t)c * 589 * 3,
+                               seg_data.data() + (size_t)(c + 1) * 589 * 3);
+            entry.embs.assign(embs.data() + (size_t)c * 3 * EMB_DIM,
+                              embs.data() + (size_t)(c + 1) * 3 * EMB_DIM);
+            CachePut(keys[c], std::move(entry));
+        }
+    }
 
     std::vector<int> hard;
     int K = 0;

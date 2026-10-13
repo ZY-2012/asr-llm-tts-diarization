@@ -24,7 +24,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "EngineWrapper.hpp"
@@ -93,6 +95,18 @@ struct Part { std::size_t begin, end; int cluster; };
 
 class DiarEngine {
  public:
+    // Per-10s-sub-window result cache.  A sub-window's segmentation masks and
+    // speaker embeddings are pure functions of its 10 s of audio, so
+    // consecutive sliding windows (90 s overlap at win=120/step=30) recompute
+    // ~73% identical work.  Keyed by a fast content hash of the sub-window
+    // samples; only full (unpadded) sub-windows are cached, so a hit is by
+    // definition bit-identical to a fresh compute.
+    struct SubWinCache {
+        std::vector<uint8_t> masks;  // 589 x 3 segmentation masks
+        std::vector<float> embs;     // 3 x EMB_DIM embeddings
+    };
+    using CacheKey = std::uint64_t;
+
     bool Init(const std::string& model_dir) {
         P.Load(model_dir);
         auto init = [&](EngineWrapper& w, const std::string& f) {
@@ -116,7 +130,20 @@ class DiarEngine {
              std::vector<Segment>& rttm,
              std::vector<Part>* parts = nullptr,
              std::vector<float>* centroids = nullptr,
-             int* num_clusters = nullptr);
+             int* num_clusters = nullptr,
+             int* cache_hits = nullptr);
+
+    // Sub-window cache lookup/store.  Returns nullptr on miss.  `full` marks
+    // whether the sub-window had the full 10 s of audio (partial, zero-padded
+    // tails are never cached nor served).
+    const SubWinCache* CacheGet(CacheKey key);
+    void CachePut(CacheKey key, SubWinCache&& entry);
+    // Contents hash of one full sub-window of samples (FNV-1a over 16-bit
+    // linear view; collision odds across a session are negligible and a
+    // collision only degrades quality to a fresh-compute level, never
+    // crashes).
+    static CacheKey HashSubWindow(const float* win);
+    std::size_t CacheSize() const { return subwin_cache_.size(); }
 
  private:
     Params P;
@@ -134,10 +161,17 @@ class DiarEngine {
 
     void SegmentWindow(const float* win, uint8_t* masks /*589*3*/);
     void Embeddings(const WavData& wav, const std::vector<uint8_t>& seg_data, int C,
-                    std::vector<float>& embs /*C*3*256*/);
+                    std::vector<float>& embs /*C*3*256*/,
+                    const std::vector<const SubWinCache*>& cached);
     void Cluster(std::vector<float>& embs, const std::vector<uint8_t>& seg_data, int C,
                  std::vector<int>& hard_clusters, int& K,
                  std::vector<float>* centroids_out = nullptr);
+
+    // sub-window cache (see SubWinCache above); insertion-ordered for FIFO
+    // eviction, since sliding windows advance and old entries stop being hit.
+    static constexpr std::size_t kCacheMaxEntries = 1024;  // ~5 MB
+    std::unordered_map<CacheKey, SubWinCache> subwin_cache_;
+    std::deque<CacheKey> subwin_cache_order_;
 };
 
 }  // namespace c1

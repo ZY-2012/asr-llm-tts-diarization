@@ -186,7 +186,9 @@ DiarResult RunRequest(c1::DiarEngine* engine, diar::SpeakerTable* table,
     std::vector<c1::Segment> rttm;
     std::vector<c1::Part> parts;
     int clusters = 0;
-    engine->Run(wav, options.step_sec, rttm, &parts, &centroids, &clusters);
+    int cache_hits = -1;
+    engine->Run(wav, options.step_sec, rttm, &parts, &centroids, &clusters,
+                &cache_hits);
 
     std::vector<long long> weights(clusters, 0);
     for (const c1::Part& part : parts)
@@ -245,10 +247,11 @@ DiarResult RunRequest(c1::DiarEngine* engine, diar::SpeakerTable* table,
     const auto elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - begin).count();
     std::fprintf(stderr,
-                 "[diar] wav=%s audio=%.2fs clusters=%d centroids=%zu parts=%zu took=%.0fms rtf=%.4f\n",
+                 "[diar] wav=%s audio=%.2fs clusters=%d centroids=%zu parts=%zu took=%.0fms rtf=%.4f cache=%d\n",
                  wav_path.c_str(), seconds, clusters,
                  centroids.size() / c1::EMB_DIM, result.parts.size(),
-                 elapsed * 1000.0, seconds > 0 ? elapsed / seconds : 0.0);
+                 elapsed * 1000.0, seconds > 0 ? elapsed / seconds : 0.0,
+                 cache_hits);
     return result;
 }
 
