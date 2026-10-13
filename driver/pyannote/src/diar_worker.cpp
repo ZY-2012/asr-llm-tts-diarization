@@ -64,6 +64,13 @@ struct Options {
     // --wav to this binary path (see DiarEngine::DumpFeatures) instead of
     // running clustering.  Requires --wav; does not touch any label timeline.
     std::string dump_features;
+    // diart-style incremental clustering inside DiarEngine::Run (config-gated
+    // alternative to the batch AHC+PLDA+VBx).  Emits the first label from the
+    // first sub-window instead of waiting for the full window buffer.
+    bool incremental = false;
+    bool incremental_plda = false;
+    float incremental_delta_new = 0.5f;
+    float incremental_rho_update = 0.4f;
 };
 
 bool ReadAll(int fd, void* data, std::size_t size) {
@@ -165,6 +172,16 @@ Options ParseArgs(int argc, char** argv) {
             options.out_rttm = RequireValue(argc, argv, &i);
         } else if (arg == "--dump-features") {
             options.dump_features = RequireValue(argc, argv, &i);
+        } else if (arg == "--incremental") {
+            options.incremental = true;
+        } else if (arg == "--incremental-plda") {
+            options.incremental_plda = true;
+        } else if (arg == "--delta-new") {
+            options.incremental_delta_new =
+                ParseFloat(RequireValue(argc, argv, &i), "--delta-new");
+        } else if (arg == "--rho-update") {
+            options.incremental_rho_update =
+                ParseFloat(RequireValue(argc, argv, &i), "--rho-update");
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
         }
@@ -193,8 +210,16 @@ DiarResult RunRequest(c1::DiarEngine* engine, diar::SpeakerTable* table,
     std::vector<c1::Part> parts;
     int clusters = 0;
     int cache_hits = -1;
+    c1::IncrementalParams inc;
+    const c1::IncrementalParams* inc_ptr = nullptr;
+    if (options.incremental) {
+        inc.use_plda = options.incremental_plda;
+        inc.delta_new = options.incremental_delta_new;
+        inc.rho_update = options.incremental_rho_update;
+        inc_ptr = &inc;
+    }
     engine->Run(wav, options.step_sec, rttm, &parts, &centroids, &clusters,
-                &cache_hits);
+                &cache_hits, inc_ptr);
 
     std::vector<long long> weights(clusters, 0);
     for (const c1::Part& part : parts)
@@ -338,6 +363,13 @@ int main(int argc, char** argv) {
                          options.online_min_new_sec,
                          options.online_min_update_sec,
                          options.online_max_speakers);
+        }
+        if (options.incremental) {
+            std::fprintf(stderr,
+                         "[diar] incremental clustering: %s delta_new=%.2f rho_update=%.2f\n",
+                         options.incremental_plda ? "plda" : "raw",
+                         options.incremental_delta_new,
+                         options.incremental_rho_update);
         }
 
         if (!options.dump_features.empty())

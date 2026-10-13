@@ -587,6 +587,144 @@ void DiarEngine::Cluster(std::vector<float>& embs, const std::vector<uint8_t>& s
 }
 
 // ---------------------------------------------------------------------------
+// diart-style incremental clustering (config-gated alternative to Cluster)
+// ---------------------------------------------------------------------------
+void DiarEngine::ClusterIncremental(std::vector<float>& embs,
+                                    const std::vector<uint8_t>& seg_data,
+                                    int C, std::vector<int>& hard_clusters, int& K,
+                                    std::vector<float>* centroids_out,
+                                    const IncrementalParams& p) {
+    const int D = EMB_DIM;
+    const int PD = p.use_plda ? 128 : D;  // matching feature dim (PLDA xvector or raw)
+    if (centroids_out) centroids_out->clear();
+
+    // Project every local-speaker embedding once (raw copy or PLDA transform).
+    std::vector<double> feats((size_t)C * 3 * PD);
+    for (int i = 0; i < C * 3; ++i) {
+        const float* xv = embs.data() + (size_t)i * D;
+        double* out = feats.data() + (size_t)i * PD;
+        if (!p.use_plda) {
+            for (int d = 0; d < D; ++d) out[d] = xv[d];
+        } else {
+            double tmp[256], tmp2[128];
+            double n = 0;
+            for (int d = 0; d < D; ++d) { tmp[d] = xv[d] - P.mean1[d]; n += tmp[d] * tmp[d]; }
+            n = std::sqrt(n) + 1e-30;
+            double sq = std::sqrt((double)D);
+            for (int d = 0; d < D; ++d) tmp[d] = tmp[d] / n * sq;
+            for (int o = 0; o < 128; ++o) {
+                double acc = 0;
+                for (int d = 0; d < D; ++d) acc += tmp[d] * P.lda[d * 128 + o];
+                tmp2[o] = acc - P.mean2[o];
+            }
+            double n2 = 0;
+            for (int o = 0; o < 128; ++o) n2 += tmp2[o] * tmp2[o];
+            n2 = std::sqrt(n2) + 1e-30;
+            double sq2 = std::sqrt(128.0);
+            for (int o = 0; o < 128; ++o) tmp2[o] = tmp2[o] / n2 * sq2 - P.plda_mu[o];
+            for (int o = 0; o < 128; ++o) {
+                double acc = 0;
+                for (int d = 0; d < 128; ++d) acc += tmp2[d] * P.plda_tr[o * 128 + d];
+                out[o] = acc;
+            }
+        }
+    }
+
+    // Running global centroids: feature space for matching, raw space for the
+    // centroids_out handed to the persistent speaker table.
+    std::vector<std::vector<double>> fc, rc;
+
+    hard_clusters.assign((size_t)C * 3, -1);
+
+    auto cosd = [](const double* a, const double* b, int dim) {
+        double dot = 0, na = 0, nb = 0;
+        for (int d = 0; d < dim; ++d) { dot += a[d] * b[d]; na += a[d] * a[d]; nb += b[d] * b[d]; }
+        return 1.0 - dot / (std::sqrt(na) * std::sqrt(nb) + 1e-12);
+    };
+
+    for (int c = 0; c < C; ++c) {
+        const uint8_t* base = seg_data.data() + (size_t)c * 589 * 3;
+        int act_frames[3] = {0, 0, 0};
+        for (int t = 0; t < 589; ++t)
+            for (int s = 0; s < 3; ++s)
+                if (base[t * 3 + s]) act_frames[s]++;
+
+        // active local speakers (hard masks: any active frame), long speakers
+        // (activation ratio >= rho_update, eligible to create/update centroids).
+        std::vector<int> al, ll;
+        for (int s = 0; s < 3; ++s) {
+            if (act_frames[s] > 0) al.push_back(s);  // tau_active (< 1) <=> any frame
+            if (act_frames[s] / 589.0 >= p.rho_update) ll.push_back(s);
+        }
+
+        int assign[3] = {-1, -1, -1};
+        if (fc.empty()) {
+            for (int s : al) {
+                int g = (int)fc.size();
+                const double* f = feats.data() + (size_t)(c * 3 + s) * PD;
+                const float* e = embs.data() + (size_t)(c * 3 + s) * D;
+                fc.push_back(std::vector<double>(f, f + PD));
+                rc.push_back(std::vector<double>(e, e + D));
+                assign[s] = g;
+            }
+        } else {
+            for (int s : al) {
+                const double* f = feats.data() + (size_t)(c * 3 + s) * PD;
+                int bg = -1;
+                double bd = 1e30;
+                for (int g = 0; g < (int)fc.size(); ++g) {
+                    double d = cosd(f, fc[g].data(), PD);
+                    if (d < bd) { bd = d; bg = g; }
+                }
+                if (bg >= 0 && bd <= p.delta_new) assign[s] = bg;
+            }
+            for (int s : al) {
+                if (assign[s] >= 0) continue;
+                bool is_long = std::find(ll.begin(), ll.end(), s) != ll.end();
+                if ((int)fc.size() < p.max_speakers && is_long) {
+                    int g = (int)fc.size();
+                    const double* f = feats.data() + (size_t)(c * 3 + s) * PD;
+                    const float* e = embs.data() + (size_t)(c * 3 + s) * D;
+                    fc.push_back(std::vector<double>(f, f + PD));
+                    rc.push_back(std::vector<double>(e, e + D));
+                    assign[s] = g;
+                } else if (!fc.empty()) {
+                    const double* f = feats.data() + (size_t)(c * 3 + s) * PD;
+                    int bg = 0;
+                    double bd = 1e30;
+                    for (int g = 0; g < (int)fc.size(); ++g) {
+                        double d = cosd(f, fc[g].data(), PD);
+                        if (d < bd) { bd = d; bg = g; }
+                    }
+                    assign[s] = bg;
+                }
+            }
+            for (int s : ll) {
+                if (assign[s] < 0) continue;
+                const double* f = feats.data() + (size_t)(c * 3 + s) * PD;
+                const float* e = embs.data() + (size_t)(c * 3 + s) * D;
+                for (int d = 0; d < PD; ++d) fc[assign[s]][d] += f[d];
+                for (int d = 0; d < D; ++d) rc[assign[s]][d] += e[d];
+            }
+        }
+
+        for (int s = 0; s < 3; ++s) hard_clusters[c * 3 + s] = assign[s];
+    }
+
+    K = (int)fc.size();
+    if (centroids_out && K > 0) {
+        centroids_out->assign((size_t)K * D, 0.0f);
+        for (int g = 0; g < K; ++g) {
+            double n = 0;
+            for (int d = 0; d < D; ++d) n += rc[g][d] * rc[g][d];
+            n = std::sqrt(n) + 1e-30;
+            for (int d = 0; d < D; ++d)
+                (*centroids_out)[(size_t)g * D + d] = (float)(rc[g][d] / n);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // top-level run
 // ---------------------------------------------------------------------------
 void DiarEngine::Run(const WavData& wav, float step_sec,
@@ -594,7 +732,8 @@ void DiarEngine::Run(const WavData& wav, float step_sec,
                      std::vector<Part>* parts,
                      std::vector<float>* centroids,
                      int* num_clusters,
-                     int* cache_hits) {
+                     int* cache_hits,
+                     const IncrementalParams* incremental) {
     step_sec_ = step_sec;
 
     const int step_samples = (int)(step_sec * SAMPLE_RATE);
@@ -678,7 +817,10 @@ void DiarEngine::Run(const WavData& wav, float step_sec,
 
     std::vector<int> hard;
     int K = 0;
-    Cluster(embs, seg_data, C, hard, K, centroids);
+    if (incremental)
+        ClusterIncremental(embs, seg_data, C, hard, K, centroids, *incremental);
+    else
+        Cluster(embs, seg_data, C, hard, K, centroids);
     if (K <= 0) {
         rttm.clear();
         if (parts) parts->clear();

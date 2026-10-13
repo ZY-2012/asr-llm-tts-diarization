@@ -93,6 +93,21 @@ struct Segment { float start, dur; int spk; };
 // indices into the analysed WAV; the ranges form a partition of [0, N).
 struct Part { std::size_t begin, end; int cluster; };
 
+// Parameters for diart-style incremental clustering (Run's config-gated
+// alternative to the batch AHC+PLDA+VBx).  Each sub-window's local speakers
+// are assigned to a running set of global speaker centroids via cosine
+// distance; a new speaker is created when the nearest centroid is farther
+// than `delta_new` and the local speaker is "long" (activation ratio >=
+// rho_update).  Centroids are accumulated (running sums), which under cosine
+// distance equals direction averaging.  First label emits from sub-window 0.
+struct IncrementalParams {
+    bool use_plda = false;     // false: raw 256-D cosine; true: PLDA 128-D
+    float delta_new = 0.5f;    // new-speaker cosine-distance threshold
+    float rho_update = 0.4f;   // centroid-update / new-speaker gate (activation ratio)
+    float tau_active = 0.6f;   // local-speaker active gate (hard masks: >0 frames)
+    int max_speakers = 20;
+};
+
 class DiarEngine {
  public:
     // Per-10s-sub-window result cache.  A sub-window's segmentation masks and
@@ -131,7 +146,8 @@ class DiarEngine {
              std::vector<Part>* parts = nullptr,
              std::vector<float>* centroids = nullptr,
              int* num_clusters = nullptr,
-             int* cache_hits = nullptr);
+             int* cache_hits = nullptr,
+             const IncrementalParams* incremental = nullptr);
 
     // Debug helper for offline clustering prototyping: runs segmentation +
     // embeddings over every `step_sec`-strided sub-window of `wav` (the exact
@@ -177,6 +193,10 @@ class DiarEngine {
     void Cluster(std::vector<float>& embs, const std::vector<uint8_t>& seg_data, int C,
                  std::vector<int>& hard_clusters, int& K,
                  std::vector<float>* centroids_out = nullptr);
+    void ClusterIncremental(std::vector<float>& embs, const std::vector<uint8_t>& seg_data,
+                            int C, std::vector<int>& hard_clusters, int& K,
+                            std::vector<float>* centroids_out,
+                            const IncrementalParams& p);
 
     // sub-window cache (see SubWinCache above); insertion-ordered for FIFO
     // eviction, since sliding windows advance and old entries stop being hit.

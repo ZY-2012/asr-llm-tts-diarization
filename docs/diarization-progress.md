@@ -209,9 +209,17 @@ vad 0.3 的能量分布与参考几乎重合，vad 0.5 明显过度保守——*
 - 产物：离线原型 `/tmp/opencode/proto_*.py`；最优 RTTM
   `/tmp/opencode/best-2p-incremental-step10.rttm`。
 
-**下一步**：diar_worker 加「PLDA 投影 + 增量聚类」模式（复用 `Cluster()` 现有 PLDA
-transform + `speaker_table` 的 min_new 门控），板端跑通 2P 端到端；混合场景可考虑
-自适应 delta_new（基于已建质心最小距离）。
+**C++ 落地（2026-10-14 完成，oneshot 模式）**：`diar_engine` 加
+`ClusterIncremental()`（raw cosine / PLDA 投影可选，`IncrementalParams` 的
+delta_new/rho_update/tau_active/max_speakers），`Run()` 加 `incremental` 参数分支；
+`diar_worker` 加 `--incremental` / `--incremental-plda` / `--delta-new` / `--rho-update`。
+板端 2P 全程（`--step 10 --incremental`）conf **0.39%** / DER **20.20%**，与离线原型
+（0.40%/20.04%）逐位一致（差异为 RTTM 3 位小数舍入）。原型脚本固化到
+`driver/pyannote/tools/incremental_proto/`（含 README + score_der.py）。
+
+**下一步（真正首标签 ~11s 的流式落地）**：oneshot 已验证增量聚类质量；首标签提速
+仍需 audio_pipeline 改为**逐 10s 子窗提交**（而非 120s 整窗缓冲），并把增量质心状态
+提升为 engine 跨请求成员（类比 `speaker_table` 的在线状态），冷启动从第 1 子窗即出标签。
 
 ## 3. 已完成的工作
 
