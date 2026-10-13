@@ -114,15 +114,16 @@ ASR 文本量稳定/略增，无退化信号。建议上板用现场录音复核
 | `MapTimelineToTrimmed` | 说话人时间线 → VAD 去静音拼接时间轴，供 ASR 切片 |
 | `diarization.mode` | `segment`（默认，实时可用）/ `session`（文件输入整场先分离） |
 | `RunSessionDiarization` | 文件输入：整场预跑一次（worker one-shot），标签按时间投影到各段 |
-| `SessionDiarizer` | 实时流式：原始 16k 缓冲、`session_chunk_sec`（默认 120s）分块、
-绝对时间线、`session_max_wait_sec`（默认 180s）等待/超时回退、退出冲刷尾块 |
+| `SessionDiarizer` | 实时流式：原始 16k 缓冲、`session_chunk_sec`（默认 120s）聚类窗、
+`session_step_sec`（默认 0=整块提交；0<step<chunk 时滑窗提交：窗以步长边界结尾、
+只提交新增核心区间）、绝对时间线、`session_max_wait_sec`（默认 180s）等待/超时回退、退出冲刷尾窗 |
 | 音频路径 | 会话 diarization 取 **FastEnhance 之前**的 16k 流（独立 decimator，与 ASR 同 16k 时基） |
 | ResultWorker 回退链 | 会话时间线覆盖 → 投影；未覆盖/失败 → 逐段 raw 窗 → 去静音段 → 整段 ASR |
 
 ### 3.4 配置 / UI / 构建 / 部署
 
-- `apm-config.h/cpp`：`Diarization` 增加 `mode`、`session_chunk_sec`、`session_max_wait_sec`，
-  含合法值校验与 YAML 解析；
+- `apm-config.h/cpp`：`Diarization` 增加 `mode`、`session_chunk_sec`、`session_step_sec`、
+  `session_max_wait_sec`，含合法值校验与 YAML 解析；
 - `sdk-config-ui.py`：分离模式下拉、分块长度、最长等待，加载/保存顺序一致；
 - `sdk-config.yaml` / `default-config.yaml`：`diarization` 段替换 `campplus`；
 - `scripts/build.sh` 编译 `build/diar-worker`；deploy/check 白名单加 diar-worker 与 pyannote 14 个模型文件；
@@ -134,11 +135,15 @@ ASR 文本量稳定/略增，无退化信号。建议上板用现场录音复核
 - `mode: session`：
   - `input: file` + `batch`：启动时整场预跑一次，输出非重叠说话人时间轴，映射到各话段
     （当前质量最佳）；
-  - 实时（ALSA / file realtime）：原始 16k 缓冲、120 s 分块送常驻 worker，
-    话段最多等待 `session_max_wait_sec` 获取覆盖，超时回退逐段；退出前冲刷尾块；
+  - 实时（ALSA / file realtime）：原始 16k 缓冲、120 s 聚类窗送常驻 worker，
+    每到 `session_step_sec`（默认 0=整块；设 30 时窗以步长边界结尾）提交一次
+    新增核心区间，话段最多等待 `session_max_wait_sec` 获取覆盖，超时回退逐段；
+    退出前用保留上下文冲刷尾窗；
 - 所有模式共用持久化 SpeakerTable（`speaker-N` 跨段稳定）；
-- 延迟：实时流式标签延迟 ≈ 分块长度 + 推理时间，上限再叠加 `session_max_wait_sec`；
-  置 0 可退回逐段低延迟模式。
+- 延迟：实时流式标签延迟 ≈ `session_step_sec`（0 时为分块长度）内的等待位置 +
+  窗推理 + part ASR，上限再叠加 `session_max_wait_sec`；
+  置 0 可退回逐段低延迟模式。滑窗（0<step<chunk）时延迟 ≈ step + 推理，
+  聚类上下文仍为整窗（见 P1b）。
 
 ## 5. 差距定位与对策
 
@@ -171,10 +176,10 @@ ASR 文本量稳定/略增，无退化信号。建议上板用现场录音复核
 
 实测：
 
-| 场景 | 指标 | 旧二进制 session | 新二进制 session | 新二进制 online |
-|---|---|---|---|---|
-| T3（Ali 240s，4 人，流式） | IDs / conf / DER | 6 / 21.83% / 57.47% | 4 / 9.54% / 45.18% | **4 / 9.54% / 45.18%** |
-| 2P（20200327，32.6 min，2 人，流式） | IDs | — | — | **2（全程 17 块零幻影）** |
+| 场景 | 指标 | 旧二进制 session | 新二进制 session | 新二进制 online | 滑窗 online（win=120/step=30） |
+|---|---|---|---|---|---|
+| T3（Ali 240s，4 人，流式） | IDs / conf / DER | 6 / 21.83% / 57.47% | 4 / 9.54% / 45.18% | **4 / 9.54% / 45.18%** | **4 / 4.82% / 40.46%** |
+| 2P（20200327，32.6 min，2 人，流式） | IDs | — | — | **2（全程 17 块零幻影）** | 2（见 P1a 滑窗实测） |
 
 2P 全程（`build/3dspk/out/report-2P-online.txt`）：块1 精确建 2 人
 （47.8s + 72.2s），后续 16 块全部静默匹配；说话占比 55.9%，与 v8 离线
@@ -207,6 +212,29 @@ T3 的簇余弦普遍 0.89–1.00，贪心与匈牙利决策无差异；online �
 按优先级：① 块间重叠窗（块长不变、提交只出核心区间，延迟降为
 chunk/2+overlap+12s）；② 双速度层（30s 粗标实时预览 + 120s 精标覆盖修正，
 即 diart DelayedAggregation 思想）；③ 首块小后续块大（冷启动友好）。
+
+#### P1b 滑窗提交（方案 ① 已实现，2026-10-13）
+
+diart 精度随延迟缓降的关键在于**分析上下文与提交粒度解耦**（5s 窗每
+0.5s 提交、聚类记忆全局累积、latency 只是输出聚合参数）。照此把
+`session_chunk_sec`（聚类窗，质量轴）与新增的 `session_step_sec`（提交
+步长，延迟轴）拆开：`SessionDiarizer` 每到步长边界就送一个以该边界
+**结尾**的整窗给 worker，但只把新增核心区间的 parts 提交进全局时间线；
+首个窗口（[0,120s)）整体提交保冷启动聚类质量；尾部用保留的上下文冲刷
+最后一次部分提交。`step=0` 或 `step=chunk` 时与旧行为完全一致（回归
+已验证）。
+
+实测（T3W，`config-t3w-ali.yaml`，win=120/step=30）：
+
+| 设计 | 标签延迟（平均/最坏） | T3 IDs | T3 conf | T3 DER | 推理占空比 |
+|---|---|---|---|---|---|
+| 120s 整块提交 | ~73s / ~135s | 4 | 9.54% | 45.18% | 10% |
+| **滑窗 win=120/step=30** | **~27s / ~42s** | **4** | **4.82%** | **40.46%** | ~40% |
+
+每窗仍是完整 120s 聚类上下文且核心区恒在窗尾（说话人已充分展开），
+conf 反而比整块提交低一半；代价是推理占空比 10%→40%（4 倍冗余聚类，
+diart 自身为 10 倍），仍远低于实时极限。2P 全程实测见
+`build/3dspk/out/report-2P-online-step30.txt`。
 
 ### P2 转录碎片整理
 

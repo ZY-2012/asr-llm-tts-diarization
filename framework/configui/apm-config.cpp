@@ -249,6 +249,8 @@ bool ValidateAppConfig(const AppConfig& c, std::string* error) {
        c.diarization.mode != "online") ||
       c.diarization.session_chunk_sec < 20.0f ||
       c.diarization.session_chunk_sec > 600.0f ||
+      c.diarization.session_step_sec < 0.0f ||
+      c.diarization.session_step_sec > c.diarization.session_chunk_sec ||
       c.diarization.session_max_wait_sec < 0.0f ||
       c.diarization.session_max_wait_sec > 900.0f ||
       c.diarization.online_min_new_speech_sec < 0.5f ||
@@ -426,6 +428,7 @@ bool LoadAppConfig(const std::string& path,
       "diarization.speaker_table_path", "diarization.speaker_match_threshold",
       "diarization.step_sec", "diarization.omp_threads",
       "diarization.session_chunk_sec", "diarization.session_max_wait_sec",
+      "diarization.session_step_sec",
       "diarization.online_min_new_speech_sec",
       "diarization.online_update_min_sec",
       "diarization.online_max_speakers",
@@ -528,6 +531,7 @@ bool LoadAppConfig(const std::string& path,
   GET_NUM("diarization.step_sec", c->diarization.step_sec);
   GET_NUM("diarization.omp_threads", c->diarization.omp_threads);
   GET_NUM("diarization.session_chunk_sec", c->diarization.session_chunk_sec);
+  GET_NUM("diarization.session_step_sec", c->diarization.session_step_sec);
   GET_NUM("diarization.session_max_wait_sec", c->diarization.session_max_wait_sec);
   GET_NUM("diarization.online_min_new_speech_sec", c->diarization.online_min_new_speech_sec);
   GET_NUM("diarization.online_update_min_sec", c->diarization.online_update_min_sec);

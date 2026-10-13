@@ -168,6 +168,7 @@ def _controls_from_config(config: dict[str, Any]) -> tuple[Any, ...]:
         _value(config, "runtime", "file_input_mode", default="realtime"),
         _value(config, "diarization", "mode", default="segment"),
         _value(config, "diarization", "session_chunk_sec", default=120.0),
+        _value(config, "diarization", "session_step_sec", default=0.0),
         _value(config, "diarization", "session_max_wait_sec", default=180.0),
         _value(config, "diarization", "online_min_new_speech_sec", default=2.0),
         _value(config, "diarization", "online_update_min_sec", default=1.0),
@@ -280,6 +281,7 @@ def build_ui(config_path: Path, apm_port: int = 7861) -> gr.Blocks:
             )
             with gr.Row():
                 diarization_chunk = gr.Number(label="流式分块长度（s）", value=_value(initial, "diarization", "session_chunk_sec", default=120.0))
+                diarization_step_commit = gr.Number(label="流式提交步长（s，0=每块整提交）", value=_value(initial, "diarization", "session_step_sec", default=0.0), info="0<步长<分块长度时启用滑窗提交：每步长秒只提交新增区间，聚类窗口仍为整块长度，标签延迟≈步长+推理，精度保持。")
                 diarization_wait = gr.Number(label="标签最长等待（s，0=立即回退）", value=_value(initial, "diarization", "session_max_wait_sec", default=180.0))
             with gr.Row():
                 online_min_new = gr.Number(label="online：新建说话人所需语音（s）", value=_value(initial, "diarization", "online_min_new_speech_sec", default=2.0))
@@ -401,7 +403,9 @@ def build_ui(config_path: Path, apm_port: int = 7861) -> gr.Blocks:
                     hojo_queue, hojo_keep_wav, hojo_output,
                     hojo_gain, hojo_npu_core,
                     input_source, input_wav, file_input_mode,
-                    diarization_mode, diarization_chunk, diarization_wait]
+                    diarization_mode, diarization_chunk, diarization_step_commit,
+                    diarization_wait, online_min_new, online_update_min,
+                    online_max_speakers]
 
         def save_values(path_text: str, *values: Any) -> tuple[str, str]:
             config = _read(path_text)
@@ -437,15 +441,27 @@ def build_ui(config_path: Path, apm_port: int = 7861) -> gr.Blocks:
                 raise gr.Error("说话人分割滑动步长必须在 (0, 10] 秒")
             if not 1 <= diarization["omp_threads"] <= 64:
                 raise gr.Error("说话人分离 OpenMP 线程数必须在 [1, 64]")
-            diarization["mode"] = str(values[-3]).strip() or "segment"
-            if diarization["mode"] not in ("segment", "session"):
-                raise gr.Error("说话人分离模式必须是 segment 或 session")
-            diarization["session_chunk_sec"] = float(values[-2])
+            diarization["mode"] = str(values[-7]).strip() or "segment"
+            if diarization["mode"] not in ("segment", "session", "online"):
+                raise gr.Error("说话人分离模式必须是 segment、session 或 online")
+            diarization["session_chunk_sec"] = float(values[-6])
             if not 20 <= diarization["session_chunk_sec"] <= 600:
                 raise gr.Error("流式分块长度必须在 [20, 600] 秒")
-            diarization["session_max_wait_sec"] = float(values[-1])
+            diarization["session_step_sec"] = float(values[-5])
+            if not 0 <= diarization["session_step_sec"] <= diarization["session_chunk_sec"]:
+                raise gr.Error("流式提交步长必须在 [0, 分块长度] 秒")
+            diarization["session_max_wait_sec"] = float(values[-4])
             if not 0 <= diarization["session_max_wait_sec"] <= 900:
                 raise gr.Error("标签最长等待必须在 [0, 900] 秒")
+            diarization["online_min_new_speech_sec"] = float(values[-3])
+            if not 0.5 <= diarization["online_min_new_speech_sec"] <= 30:
+                raise gr.Error("online 新建说话人所需语音必须在 [0.5, 30] 秒")
+            diarization["online_update_min_sec"] = float(values[-2])
+            if not 0 <= diarization["online_update_min_sec"] <= 30:
+                raise gr.Error("online 更新质心所需语音必须在 [0, 30] 秒")
+            diarization["online_max_speakers"] = int(values[-1])
+            if not 2 <= diarization["online_max_speakers"] <= 40:
+                raise gr.Error("online 说话人数量上限必须在 [2, 40]")
             asr = config.setdefault("asr", {})
             asr.pop("runner", None)
             asr.update({"enabled": bool(values[25]), "library": str(values[26]).strip(), "model_path": str(values[27]).strip(), "model_type": str(values[28]).strip(), "language": str(values[29]).strip(), "npu_core": 1})

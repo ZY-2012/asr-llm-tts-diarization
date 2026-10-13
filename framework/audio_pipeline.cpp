@@ -1892,9 +1892,21 @@ std::vector<Segment::Part> RunSessionDiarization(
 // absolute timeline.  ResultWorker maps each VAD segment onto that timeline.
 class SessionDiarizer {
  public:
-  explicit SessionDiarizer(double chunk_sec)
-      : chunk_samples_(static_cast<std::size_t>(
-            std::max(1.0, chunk_sec) * kRateOut)) {}
+  // `chunk_sec` is the clustering window (analysis context); `step_sec` is the
+  // commit step (0 = legacy: one commit per full chunk).  When 0 < step <
+  // chunk, the worker clusters a full `chunk_sec` window ending at every step
+  // boundary but only the newest step-sized core region is committed to the
+  // timeline (diart-style decoupling: label latency ~ step + inference while
+  // the clustering context stays a full chunk long).  The very first window
+  // commits in full so speaker discovery bootstraps with the whole context.
+  SessionDiarizer(double chunk_sec, double step_sec)
+      : window_samples_(static_cast<std::size_t>(
+            std::max(1.0, chunk_sec) * kRateOut)),
+        step_samples_(static_cast<std::size_t>(
+            std::max(0.0, step_sec) * kRateOut)) {
+    if (step_samples_ == 0 || step_samples_ >= window_samples_)
+      step_samples_ = window_samples_;  // legacy: commit per full chunk
+  }
   ~SessionDiarizer() { Stop(); }
 
   void Start(DiarWorker* worker, const std::string& work_dir) {
@@ -1909,8 +1921,12 @@ class SessionDiarizer {
   void Append(const std::vector<int16_t>& hop) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (closed_) return;
+    if (!stream_started_ && !hop.empty()) {
+      stream_started_ = true;
+      stream_t0_ = std::chrono::steady_clock::now();
+    }
     buffer_.insert(buffer_.end(), hop.begin(), hop.end());
-    if (buffer_.size() >= chunk_samples_) ready_.notify_all();
+    ready_.notify_all();
   }
 
   bool Covers(std::size_t end) const {
@@ -1945,18 +1961,29 @@ class SessionDiarizer {
     return timeline_;
   }
 
-  // Processes the final partial chunk (pipeline shutdown); call after Stop().
+  // Processes the final partial core region (pipeline shutdown); call after
+  // Stop().  Clusters the last full window of retained context.
   void ProcessRemaining() {
-    std::vector<int16_t> chunk;
-    std::size_t chunk_start = 0;
+    std::vector<int16_t> tail;
+    std::size_t base = 0, frontier = 0, committed = 0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      chunk_start = committed_;
-      chunk = std::move(buffer_);
+      base = base_;
+      frontier = base_ + buffer_.size();
+      committed = committed_;
+      tail = std::move(buffer_);
       buffer_.clear();
+      base_ = frontier;
     }
-    if (!worker_ || chunk.size() < static_cast<std::size_t>(kRateOut)) return;
-    RunChunk(chunk_start, chunk);
+    if (!worker_ || committed >= frontier) return;
+    const std::size_t window_begin =
+        std::max(base, frontier > window_samples_ ? frontier - window_samples_
+                                                  : static_cast<std::size_t>(0));
+    if (window_begin >= frontier) return;
+    tail.erase(tail.begin(),
+               tail.begin() + static_cast<std::ptrdiff_t>(window_begin - base));
+    if (tail.size() < static_cast<std::size_t>(kRateOut)) return;
+    RunWindow(window_begin, committed, frontier, tail);
   }
 
   void Stop() {
@@ -1969,30 +1996,61 @@ class SessionDiarizer {
   }
 
  private:
+  // Absolute source position the frontier must reach before the next commit.
+  std::size_t NeedNoLock() const {
+    if (committed_ == 0) return window_samples_;  // cold start: full window
+    return committed_ + step_samples_;
+  }
+
+  // Earliest source position still needed: the next window ends at
+  // committed_ + step and spans window_samples_.
+  std::size_t KeepFromNoLock() const {
+    if (step_samples_ >= window_samples_) return committed_;
+    if (committed_ + step_samples_ > window_samples_)
+      return committed_ + step_samples_ - window_samples_;
+    return 0;
+  }
+
+  double WallSecNoLock() const {
+    if (!stream_started_) return 0.0;
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                         stream_t0_).count();
+  }
+
   void Loop() {
     while (true) {
-      std::vector<int16_t> chunk;
-      std::size_t chunk_start = 0;
+      std::vector<int16_t> window;
+      std::size_t window_begin = 0, core_begin = 0, core_end = 0;
       {
         std::unique_lock<std::mutex> lock(mutex_);
-        ready_.wait(lock,
-                    [&] { return closed_ || buffer_.size() >= chunk_samples_; });
+        ready_.wait(lock, [&] {
+          return closed_ ||
+                 base_ + buffer_.size() >= NeedNoLock();
+        });
         if (closed_) return;
-        chunk_start = committed_;
-        chunk.assign(buffer_.begin(),
-                     buffer_.begin() + static_cast<std::ptrdiff_t>(chunk_samples_));
+        core_begin = committed_;
+        core_end = NeedNoLock();
+        window_begin = (core_end > window_samples_)
+                           ? core_end - window_samples_
+                           : static_cast<std::size_t>(0);
+        window.assign(
+            buffer_.begin() + static_cast<std::ptrdiff_t>(window_begin - base_),
+            buffer_.begin() + static_cast<std::ptrdiff_t>(core_end - base_));
       }
-      RunChunk(chunk_start, chunk);
+      RunWindow(window_begin, core_begin, core_end, window);
     }
   }
 
-  void RunChunk(std::size_t chunk_start, const std::vector<int16_t>& chunk) {
+  // Clusters `window` (absolute [window_begin, core_end)) and commits only
+  // the parts intersecting the core region [core_begin, core_end).
+  void RunWindow(std::size_t window_begin, std::size_t core_begin,
+                 std::size_t core_end, const std::vector<int16_t>& window) {
     if (!worker_) return;
     const fs::path wav = fs::path(work_dir_) /
-        ("session-" + std::to_string(chunk_start) + ".wav");
+        ("session-" + std::to_string(window_begin) + ".wav");
     std::vector<Segment::Part> parts;
-    if (WriteWav(wav, chunk, kRateOut)) {
-      parts = worker_->Label(wav.string(), chunk.size());
+    if (WriteWav(wav, window, kRateOut)) {
+      parts = worker_->Label(wav.string(), window.size());
       std::error_code ec;
       fs::remove(wav, ec);
     } else {
@@ -2001,9 +2059,11 @@ class SessionDiarizer {
     std::vector<Segment::Part> commit;
     commit.reserve(parts.size());
     for (const auto& part : parts) {
+      const std::size_t begin = window_begin + part.begin;
+      const std::size_t end = window_begin + part.end;
       Segment::Part entry;
-      entry.begin = chunk_start + part.begin;
-      entry.end = chunk_start + part.end;
+      entry.begin = std::max(begin, core_begin);
+      entry.end = std::min(end, core_end);
       entry.speaker_id = part.speaker_id;
       if (entry.end > entry.begin) commit.push_back(std::move(entry));
     }
@@ -2014,29 +2074,39 @@ class SessionDiarizer {
                        [](const Segment::Part& a, const Segment::Part& b) {
                          return a.begin < b.begin;
                        });
-      const std::size_t advance = chunk.size();
-      committed_ = std::max(committed_, chunk_start + advance);
-      buffer_.erase(buffer_.begin(),
-                    buffer_.begin() + static_cast<std::ptrdiff_t>(
-                        std::min(buffer_.size(), advance)));
-      std::cerr << "[diar] session chunk start=" << chunk_start / kRateOut
-                << "s len=" << advance / kRateOut << "s parts="
-                << commit.size() << " committed=" << committed_ / kRateOut
-                << "s\n";
+      committed_ = std::max(committed_, core_end);
+      const std::size_t keep_from = KeepFromNoLock();
+      if (base_ < keep_from) {
+        const std::size_t erase_n = std::min(buffer_.size(), keep_from - base_);
+        buffer_.erase(buffer_.begin(),
+                      buffer_.begin() + static_cast<std::ptrdiff_t>(erase_n));
+        base_ += erase_n;
+      }
+      const double wall = WallSecNoLock();
+      std::cerr << "[diar] session window start=" << window_begin / kRateOut
+                << "s len=" << window.size() / kRateOut << "s core=["
+                << core_begin / kRateOut << "s," << core_end / kRateOut
+                << "s) parts=" << commit.size()
+                << " committed=" << committed_ / kRateOut
+                << "s wall=+" << wall << "s\n";
     }
     ready_.notify_all();
   }
 
-  std::size_t chunk_samples_;
+  std::size_t window_samples_;          // clustering context (analysis window)
+  std::size_t step_samples_;            // commit step (== window: legacy)
   DiarWorker* worker_ = nullptr;
   std::string work_dir_;
   mutable std::mutex mutex_;
   std::condition_variable ready_;
-  std::vector<int16_t> buffer_;          // starts at absolute `committed_`
-  std::size_t committed_ = 0;            // samples fully diarized
+  std::vector<int16_t> buffer_;          // starts at absolute `base_`
+  std::size_t base_ = 0;                 // absolute position of buffer_[0]
+  std::size_t committed_ = 0;            // samples with final labels
   std::vector<Segment::Part> timeline_;  // absolute speaker parts
   bool closed_ = false;
   bool finished_ = false;               // final verdict; no commits follow
+  bool stream_started_ = false;
+  std::chrono::steady_clock::time_point stream_t0_;
   std::thread thread_;
 };
 
@@ -2123,12 +2193,16 @@ class ResultWorker {
           "Speaker diarization is enabled but its worker is unavailable");
     if (streaming_session) {
       session_ = std::make_unique<SessionDiarizer>(
-          c_.diarization.session_chunk_sec);
+          c_.diarization.session_chunk_sec, c_.diarization.session_step_sec);
       session_->Start(&diarrer_, c_.output.temp_dir);
       std::cerr << "[diar] streaming session diarization mode="
                 << c_.diarization.mode << " chunk="
-                << c_.diarization.session_chunk_sec << "s max_wait="
-                << c_.diarization.session_max_wait_sec << "s\n";
+                << c_.diarization.session_chunk_sec << "s step="
+                << (c_.diarization.session_step_sec > 0.0f
+                        ? c_.diarization.session_step_sec
+                        : c_.diarization.session_chunk_sec)
+                << "s max_wait=" << c_.diarization.session_max_wait_sec
+                << "s\n";
     }
   }
 

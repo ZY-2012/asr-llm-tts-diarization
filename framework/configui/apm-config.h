@@ -123,6 +123,14 @@ struct AppConfig {
     // Streaming session mode: chunk length sent to the resident worker for
     // realtime inputs (ALSA, or file input in realtime emulation mode).
     float session_chunk_sec = 120.0f;
+    // Streaming session mode: overlapping-window commit step (diart-style
+    // decoupling of clustering context from commit granularity).  0 keeps
+    // the legacy behaviour (one commit per full chunk).  With 0 < step <
+    // chunk the worker clusters a `session_chunk_sec` window ending at every
+    // step boundary but only commits the newest step-sized core region, so
+    // label latency drops to ~step + inference while the clustering context
+    // stays a full chunk long.
+    float session_step_sec = 0.0f;
     // How long a segment may wait for the session timeline to cover it before
     // falling back to per-segment diarization (0 = never wait).
     float session_max_wait_sec = 180.0f;
