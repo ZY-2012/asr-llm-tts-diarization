@@ -617,6 +617,19 @@ bool WriteParts(const fs::path& wav, const std::vector<Segment::Part>& parts) {
 // offsets.  On overlap the longest timeline range wins, then unassigned
 // samples inherit the nearest label so the resulting ranges partition
 // [0, trimmed_samples).
+//
+// P2 part cleanup (docs/diarization-progress.md): sliding-window commits cut
+// a continuous speech region at every core boundary and speaker changes cut
+// the stream into many small parts, each of which becomes one ASR request
+// (hence junk "。"-only or empty transcript lines).  (A) adjacent parts with
+// the same speaker are re-joined — the samples and their speaker are
+// unchanged, only the arbitrary split disappears; (B) parts shorter than
+// kMinPartSamples are absorbed into the longer neighbour — speaker
+// attribution moves by <0.3 s at a time.  Measured on the 2P run:
+// 418 -> 236 parts, v8 agreement 91.6% -> 91.5%; T3 conf is unchanged up to
+// 0.3 s and degrades beyond it (threshold sweep in the eval assets).
+constexpr std::size_t kMinPartSamples = kRateOut * 3 / 10;  // 0.3 s
+
 std::vector<Segment::Part> MapTimelineToTrimmed(
     const std::vector<Segment::Part>& timeline,
     std::size_t timeline_offset,
@@ -671,14 +684,45 @@ std::vector<Segment::Part> MapTimelineToTrimmed(
       const std::string& speaker =
           timeline[static_cast<std::size_t>(id)].speaker_id;
       if (!speaker.empty()) {
-        Segment::Part part;
-        part.begin = i;
-        part.end = j;
-        part.speaker_id = speaker;
-        parts.push_back(std::move(part));
+        // (A) re-join regions split at a commit boundary: adjacent timeline
+        // entries with the same speaker are one utterance.
+        if (!parts.empty() && parts.back().end == i &&
+            parts.back().speaker_id == speaker) {
+          parts.back().end = j;
+        } else {
+          Segment::Part part;
+          part.begin = i;
+          part.end = j;
+          part.speaker_id = speaker;
+          parts.push_back(std::move(part));
+        }
       }
     }
     i = j;
+  }
+  // (B) absorb sub-0.5 s fragments into the longer neighbour; such requests
+  // only produce junk ASR lines and their speaker attribution is unreliable.
+  while (parts.size() > 1) {
+    std::size_t victim = parts.size();
+    for (std::size_t p = 0; p < parts.size(); ++p) {
+      if (parts[p].end - parts[p].begin < kMinPartSamples) {
+        victim = p;
+        break;
+      }
+    }
+    if (victim == parts.size()) break;
+    bool absorb_left = victim > 0;
+    if (victim > 0 && victim + 1 < parts.size()) {
+      const std::size_t prev_span = parts[victim - 1].end - parts[victim - 1].begin;
+      const std::size_t next_span = parts[victim + 1].end - parts[victim + 1].begin;
+      absorb_left = prev_span >= next_span;
+    }
+    if (absorb_left) {
+      parts[victim - 1].end = parts[victim].end;
+    } else {
+      parts[victim + 1].begin = parts[victim].begin;
+    }
+    parts.erase(parts.begin() + static_cast<std::ptrdiff_t>(victim));
   }
   return parts;
 }
