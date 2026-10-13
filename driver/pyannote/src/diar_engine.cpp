@@ -815,4 +815,65 @@ void DiarEngine::Run(const WavData& wav, float step_sec,
     }
 }
 
+void DiarEngine::DumpFeatures(const WavData& wav, float step_sec,
+                              const std::string& path) {
+    step_sec_ = step_sec;
+
+    // Same sub-window geometry as Run(): `step_sec` stride, 10 s windows.
+    const int step_samples = (int)(step_sec * SAMPLE_RATE);
+    const int n = (int)wav.samples.size();
+    int n_full = 0;
+    if (n >= WINDOW_SAMPLES) n_full = 1 + (n - WINDOW_SAMPLES) / step_samples;
+    int rem = (n >= WINDOW_SAMPLES) ? (n - WINDOW_SAMPLES) % step_samples : n;
+    int C = n_full + ((n < WINDOW_SAMPLES || rem > 0) ? 1 : 0);
+
+    std::vector<uint8_t> seg_data((size_t)C * 589 * 3, 0);
+    std::vector<float> win(WINDOW_SAMPLES);
+    std::vector<const SubWinCache*> cached(C, nullptr);
+    std::vector<CacheKey> keys(C, 0);
+    for (int c = 0; c < C; ++c) {
+        int s0 = c * step_samples;
+        memset(win.data(), 0, WINDOW_SAMPLES * sizeof(float));
+        int avail = std::min(WINDOW_SAMPLES, n - s0);
+        if (avail > 0)
+            memcpy(win.data(), wav.samples.data() + s0, avail * sizeof(float));
+        if (avail == WINDOW_SAMPLES) {
+            keys[c] = HashSubWindow(win.data());
+            if (const SubWinCache* hit = CacheGet(keys[c])) {
+                memcpy(seg_data.data() + (size_t)c * 589 * 3, hit->masks.data(),
+                       (size_t)589 * 3);
+                cached[c] = hit;
+                continue;
+            }
+        }
+        SegmentWindow(win.data(), seg_data.data() + (size_t)c * 589 * 3);
+    }
+
+    std::vector<float> embs;
+    Embeddings(wav, seg_data, C, embs, cached);
+
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        std::fprintf(stderr, "[diar] DumpFeatures: cannot write %s\n",
+                     path.c_str());
+        return;
+    }
+    const char magic[8] = {'C', '1', 'D', 'I', 'A', 'R', '1', '\0'};
+    std::fwrite(magic, 1, 8, f);
+    uint32_t C32 = (uint32_t)C;
+    uint32_t step32 = (uint32_t)step_samples;
+    std::fwrite(&C32, 4, 1, f);
+    std::fwrite(&step32, 4, 1, f);
+    for (int c = 0; c < C; ++c) {
+        uint32_t s0 = (uint32_t)(c * step_samples);
+        std::fwrite(&s0, 4, 1, f);
+        std::fwrite(seg_data.data() + (size_t)c * 589 * 3, 1, (size_t)589 * 3, f);
+        std::fwrite(embs.data() + (size_t)c * 3 * EMB_DIM, sizeof(float),
+                    (size_t)3 * EMB_DIM, f);
+    }
+    std::fclose(f);
+    std::fprintf(stderr, "[diar] DumpFeatures: %s <- C=%d step=%d\n",
+                 path.c_str(), C, step_samples);
+}
+
 }  // namespace c1

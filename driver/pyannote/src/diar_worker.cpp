@@ -60,6 +60,10 @@ struct Options {
     bool oneshot = false;
     std::string wav_path;
     std::string out_rttm;
+    // Offline-prototyping helper: dump per-sub-window masks + embeddings for
+    // --wav to this binary path (see DiarEngine::DumpFeatures) instead of
+    // running clustering.  Requires --wav; does not touch any label timeline.
+    std::string dump_features;
 };
 
 bool ReadAll(int fd, void* data, std::size_t size) {
@@ -159,6 +163,8 @@ Options ParseArgs(int argc, char** argv) {
             options.wav_path = RequireValue(argc, argv, &i);
         } else if (arg == "--out") {
             options.out_rttm = RequireValue(argc, argv, &i);
+        } else if (arg == "--dump-features") {
+            options.dump_features = RequireValue(argc, argv, &i);
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
         }
@@ -297,6 +303,12 @@ int RunOneshot(c1::DiarEngine* engine, diar::SpeakerTable* table,
     return 0;
 }
 
+int RunDumpFeatures(c1::DiarEngine* engine, const Options& options) {
+    WavData wav = read_wav(options.wav_path);
+    engine->DumpFeatures(wav, options.step_sec, options.dump_features);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -328,6 +340,8 @@ int main(int argc, char** argv) {
                          options.online_max_speakers);
         }
 
+        if (!options.dump_features.empty())
+            return RunDumpFeatures(&engine, options);
         if (options.oneshot) return RunOneshot(&engine, &table, options);
         if (!WriteFrame(response_fd, 'R', "ready")) return 1;
 

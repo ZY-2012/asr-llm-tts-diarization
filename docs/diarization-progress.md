@@ -175,6 +175,44 @@ vad 0.3 的能量分布与参考几乎重合，vad 0.5 明显过度保守——*
   并成一个簇（fw=30 首窗只出 1 个说话人，fw=60 出 4 个）。**默认关闭**，
   仅在能接受开局区间质量下降、且更看重首标签及时性的场景启用。
 
+### 2.6 diart 式增量聚类探索（2026-10-14，离线原型量化）
+
+**目标**：参考 diart 的 `OnlineSpeakerClustering`（5s 滚窗 + 增量聚类，首标签 ~5s），
+把冷启动首标签从 132.3s 降下来，同时保持 2P 精度（参考 `label-2P-v8-recheck.txt`）。
+
+**方法**：逐 10s 子窗导出 segmentation mask + 3×256 embedding（`diar_worker --dump-features`，
+纯追加调试路径、不动标签时间轴），host 上跑 diart 式增量聚类
+（cosine 距离 + 质心累加 + `delta_new` 门控），从第 1 个子窗即出标签。
+
+**结论（2P 全程 1955s，`score_der.py` collar 0.25，参考 v8-recheck）**：
+
+| 指标 | online-vad30（批处理基线） | 增量聚类（raw cosine dn=0.5 rho=0.4） |
+|---|---|---|
+| 首标签 | 132.3s | **~11s**（10s 首窗 + ~1.2s 推理） |
+| conf | 4.51% | **0.40%**（≈4.8s，5 个 <2s 边界片段） |
+| miss | 3.79% | 19.60%（diar segmentation 比 VAD 保守） |
+| fa | 31.33% | **0.04%** |
+| DER | 39.63% | **20.04%** |
+
+- 首标签提前 ~12 倍、conf 改善 ~11 倍；conf 4.8s 错分全是说话人切换边界的
+  短暂混淆（684s/878s/1545s/1934s/1950s 处 <2s 片段），非冷启动问题。
+- miss 19.60% 是 diar 在整段原始音频上自己判语音所致（覆盖 1120s vs VAD 1364s），
+  **非聚类问题**；落地保持「VAD 判语音 + diar 只分说话人」结构即可降到 ~3.79%。
+- 三场景验证（2P / EN2002c 3 人 / T3 4 人）：增量 conf 均不退化
+  （0.40% / 4.61% / 4.28%，后者略优于批处理 5.65~7.82%）。
+- **delta_new 按场景敏感**（说话人越多阈值越小）：raw cosine 无统一值
+  （2P 需 ~1.0、T3 需 ~0.5）；PLDA 判别投影（256→128，`plda.bin` 的
+  mean1/mean2/lda/plda_mu/plda_tr）后 delta_new=0.55 三场景统一（脆弱交集点，
+  2P 单独用 raw cosine 更优）。
+- step=2 重叠子窗 conf 0.32%（略优 0.40%）但 DER 略差、推理 5 倍、首标签不更早，
+  工程上不值，保留 step=10。
+- 产物：离线原型 `/tmp/opencode/proto_*.py`；最优 RTTM
+  `/tmp/opencode/best-2p-incremental-step10.rttm`。
+
+**下一步**：diar_worker 加「PLDA 投影 + 增量聚类」模式（复用 `Cluster()` 现有 PLDA
+transform + `speaker_table` 的 min_new 门控），板端跑通 2P 端到端；混合场景可考虑
+自适应 delta_new（基于已建质心最小距离）。
+
 ## 3. 已完成的工作
 
 ### 3.1 模型与引擎

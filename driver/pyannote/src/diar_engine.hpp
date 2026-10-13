@@ -133,6 +133,17 @@ class DiarEngine {
              int* num_clusters = nullptr,
              int* cache_hits = nullptr);
 
+    // Debug helper for offline clustering prototyping: runs segmentation +
+    // embeddings over every `step_sec`-strided sub-window of `wav` (the exact
+    // per-sub-window tensors Run() would consume, served from the sub-window
+    // cache when available) and writes them to `path` as a binary feature dump:
+    //   magic "C1DIAR1\0" (8 bytes) | uint32 C | uint32 step_samples |
+    //   per sub-window c: uint32 s0 (sample offset) | 589*3 uint8 masks |
+    //                   3*EMB_DIM float32 embeddings.
+    // No clustering is performed, so this never touches the label timeline.
+    void DumpFeatures(const WavData& wav, float step_sec,
+                      const std::string& path);
+
     // Sub-window cache lookup/store.  Returns nullptr on miss.  `full` marks
     // whether the sub-window had the full 10 s of audio (partial, zero-padded
     // tails are never cached nor served).
