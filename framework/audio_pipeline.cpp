@@ -130,6 +130,11 @@ constexpr int kRateIn = 48000;
 constexpr int kRateOut = 16000;
 constexpr size_t kEnhanceHop = 512;
 
+// diar-worker assignment args (defined after the worker classes; the resident
+// worker's StartProcess needs it before its definition).
+void AddAssignArgs(std::vector<std::string>* args,
+                   const apm_example::AppConfig::Diarization& config);
+
 std::string ShellQuote(const std::string& s);
 std::string TimeStamp(WallClock::time_point t);
 
@@ -1680,6 +1685,7 @@ class DiarWorker {
     AddArg(&args, "--threshold", std::to_string(config_.speaker_match_threshold));
     AddArg(&args, "--threads", std::to_string(config_.omp_threads));
     AddArg(&args, "--response-fd", "3");
+    AddAssignArgs(&args, config_);
 
     pid_ = fork();
     if (pid_ < 0) {
@@ -1740,6 +1746,23 @@ class DiarWorker {
   bool closed_ = false;
   std::mutex mutex_;
 };
+
+// Extra diar-worker args selecting the assignment strategy.  The "online"
+// mode uses diart-style joint Hungarian assignment with speech-gated speaker
+// creation; every other mode keeps the legacy greedy matcher untouched.
+void AddAssignArgs(std::vector<std::string>* args,
+                   const apm_example::AppConfig::Diarization& config) {
+  if (config.mode == "online") {
+    args->push_back("--assign");
+    args->push_back("online");
+    args->push_back("--min-new-sec");
+    args->push_back(std::to_string(config.online_min_new_speech_sec));
+    args->push_back("--update-min-sec");
+    args->push_back(std::to_string(config.online_update_min_sec));
+    args->push_back("--max-speakers");
+    args->push_back(std::to_string(config.online_max_speakers));
+  }
+}
 
 // Reads the sample rate from a RIFF/WAVE file; returns 0 when the file is not
 // a readable WAV.  Session diarization needs the source sample rate to map the
@@ -1807,6 +1830,7 @@ std::vector<Segment::Part> RunSessionDiarization(
   args.push_back(std::to_string(config.omp_threads));
   args.push_back("--wav");
   args.push_back(AbsolutePath(wav_path));
+  AddAssignArgs(&args, config);
   const pid_t pid = fork();
   if (pid < 0) {
     close(out_pipe[0]);
@@ -1894,12 +1918,26 @@ class SessionDiarizer {
     return committed_ >= end;
   }
 
-  // Waits until the timeline covers `end`; false on timeout or shutdown.
+  // Waits until the timeline covers `end`; false on timeout or once the
+  // final chunk has committed without covering it (Finish).  Input closure
+  // alone (Stop) does NOT end the wait: the final chunk's timeline is still
+  // being produced by ProcessRemaining, and waking waiters early would send
+  // them to the per-segment fallback with phantom-speaker side effects.
   bool WaitCovered(std::size_t end, std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(mutex_);
     const bool notified = ready_.wait_for(lock, timeout,
-        [&] { return closed_ || committed_ >= end; });
+        [&] { return finished_ || committed_ >= end; });
     return notified && committed_ >= end;
+  }
+
+  // Final verdict: no further timeline commits will arrive.  Unblocks the
+  // remaining waiters so they can fall back per-segment.
+  void Finish() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      finished_ = true;
+    }
+    ready_.notify_all();
   }
 
   std::vector<Segment::Part> Timeline() const {
@@ -1998,6 +2036,7 @@ class SessionDiarizer {
   std::size_t committed_ = 0;            // samples fully diarized
   std::vector<Segment::Part> timeline_;  // absolute speaker parts
   bool closed_ = false;
+  bool finished_ = false;               // final verdict; no commits follow
   std::thread thread_;
 };
 
@@ -2059,7 +2098,7 @@ class ResultWorker {
   void StartDiarization() {
     if (!c_.diarization.enabled) return;
     bool streaming_session = false;
-    if (c_.diarization.mode == "session") {
+    if (c_.diarization.mode == "session" || c_.diarization.mode == "online") {
       const bool file_input = c_.runtime.input == "file";
       if (file_input && c_.runtime.file_input_mode != "realtime") {
         // Batch file input: diarize the whole source once and reuse the
@@ -2086,7 +2125,8 @@ class ResultWorker {
       session_ = std::make_unique<SessionDiarizer>(
           c_.diarization.session_chunk_sec);
       session_->Start(&diarrer_, c_.output.temp_dir);
-      std::cerr << "[diar] streaming session diarization chunk="
+      std::cerr << "[diar] streaming session diarization mode="
+                << c_.diarization.mode << " chunk="
                 << c_.diarization.session_chunk_sec << "s max_wait="
                 << c_.diarization.session_max_wait_sec << "s\n";
     }
@@ -2101,12 +2141,18 @@ class ResultWorker {
     if (closed_) return;
     closed_ = true;
     if (session_) {
-      session_->Stop();
-      if (!abort) session_->ProcessRemaining();
-      session_.reset();
+      if (!abort) {
+        session_->Stop();
+        session_->ProcessRemaining();
+      }
+      // Final verdict after the last commit: unblocks any remaining timeline
+      // waiters (they then fall back per-segment).  Kept alive until the
+      // result thread joins because that thread owns pending waits.
+      session_->Finish();
     }
     jobs_.Close();
     if (thread_.joinable()) thread_.join();
+    session_.reset();
     diarrer_.Close();
     // Models are loaded Hojo -> Qwen -> SenseVoice. Release them in reverse
     // order so Qwen's process-wide CMM sentry does not count the later-loaded

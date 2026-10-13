@@ -169,6 +169,9 @@ def _controls_from_config(config: dict[str, Any]) -> tuple[Any, ...]:
         _value(config, "diarization", "mode", default="segment"),
         _value(config, "diarization", "session_chunk_sec", default=120.0),
         _value(config, "diarization", "session_max_wait_sec", default=180.0),
+        _value(config, "diarization", "online_min_new_speech_sec", default=2.0),
+        _value(config, "diarization", "online_update_min_sec", default=1.0),
+        _value(config, "diarization", "online_max_speakers", default=20),
     )
 
 
@@ -271,13 +274,17 @@ def build_ui(config_path: Path, apm_port: int = 7861) -> gr.Blocks:
                 diarization_threads = gr.Number(label="OpenMP 线程数", value=_value(initial, "diarization", "omp_threads", default=4), precision=0)
             diarization_mode = gr.Dropdown(
                 label="分离模式",
-                choices=["segment", "session"],
+                choices=["segment", "session", "online"],
                 value=_value(initial, "diarization", "mode", default="segment"),
-                info="segment=每个 VAD 话段独立分离（低延迟）；session=文件批量启动时整段分离并映射到各话段；实时输入按分块会话级处理。",
+                info="segment=每个 VAD 话段独立分离（低延迟）；session=文件批量启动时整段分离并映射到各话段；online=传输同 session，但采用 diart 式在线聚类（匈牙利整体匹配+建人语音门控+人数上限），用于实时模式说话人一致性。",
             )
             with gr.Row():
                 diarization_chunk = gr.Number(label="流式分块长度（s）", value=_value(initial, "diarization", "session_chunk_sec", default=120.0))
                 diarization_wait = gr.Number(label="标签最长等待（s，0=立即回退）", value=_value(initial, "diarization", "session_max_wait_sec", default=180.0))
+            with gr.Row():
+                online_min_new = gr.Number(label="online：新建说话人所需语音（s）", value=_value(initial, "diarization", "online_min_new_speech_sec", default=2.0))
+                online_update_min = gr.Number(label="online：更新质心所需语音（s）", value=_value(initial, "diarization", "online_update_min_sec", default=1.0))
+                online_max_speakers = gr.Number(label="online：说话人数量上限", value=_value(initial, "diarization", "online_max_speakers", default=20), precision=0)
         with gr.Tab("SenseVoice / 输出"):
             sensevoice_enabled = gr.Checkbox(label="启用 SenseVoice", value=_value(initial, "asr", "enabled", default=True))
             sensevoice_library = gr.Textbox(label="SenseVoice 动态库", value=_value(initial, "asr", "library", default="driver/asr/sensevoice/lib/libax_asr_api.so"))

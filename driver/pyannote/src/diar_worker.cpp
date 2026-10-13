@@ -44,6 +44,13 @@ struct Options {
     std::string table_path = "/tmp/ax-audio-sdk/speakers.json";
     float step_sec = 2.0f;
     float speaker_match_threshold = 0.55f;
+    // "greedy": legacy per-cluster threshold matching (default, unchanged).
+    // "online": diart-style joint Hungarian assignment with speech-gated
+    // speaker creation and centroid updates (realtime online mode).
+    std::string assign_mode = "greedy";
+    float online_min_new_sec = 2.0f;
+    float online_min_update_sec = 1.0f;
+    int online_max_speakers = 20;
     int omp_threads = 4;
     int response_fd = 3;
     // Evaluation helper: also dump the engine's native (overlap-capable) RTTM
@@ -128,6 +135,19 @@ Options ParseArgs(int argc, char** argv) {
         } else if (arg == "--threshold") {
             options.speaker_match_threshold =
                 ParseFloat(RequireValue(argc, argv, &i), "--threshold");
+        } else if (arg == "--assign") {
+            options.assign_mode = RequireValue(argc, argv, &i);
+            if (options.assign_mode != "greedy" && options.assign_mode != "online")
+                throw std::invalid_argument("--assign must be greedy or online");
+        } else if (arg == "--min-new-sec") {
+            options.online_min_new_sec =
+                ParseFloat(RequireValue(argc, argv, &i), "--min-new-sec");
+        } else if (arg == "--update-min-sec") {
+            options.online_min_update_sec =
+                ParseFloat(RequireValue(argc, argv, &i), "--update-min-sec");
+        } else if (arg == "--max-speakers") {
+            options.online_max_speakers =
+                ParseInt(RequireValue(argc, argv, &i), "--max-speakers");
         } else if (arg == "--threads") {
             options.omp_threads = ParseInt(RequireValue(argc, argv, &i), "--threads");
         } else if (arg == "--response-fd") {
@@ -174,8 +194,29 @@ DiarResult RunRequest(c1::DiarEngine* engine, diar::SpeakerTable* table,
             weights[part.cluster] += static_cast<long long>(part.end - part.begin);
     const long long now = static_cast<long long>(std::chrono::system_clock::to_time_t(
         std::chrono::system_clock::now()));
-    result.speakers = table->Assign(centroids, c1::EMB_DIM, weights,
-                                    options.speaker_match_threshold, now);
+    if (options.assign_mode == "online") {
+        diar::SpeakerTable::OnlineParams params;
+        params.threshold = options.speaker_match_threshold;
+        params.min_new_sec = options.online_min_new_sec;
+        params.min_update_sec = options.online_min_update_sec;
+        params.max_speakers = options.online_max_speakers;
+        // Per-segment raw-window fallback (WAVs the pipeline names "*.raw.wav")
+        // has no birth rights: a fallback segment blends multiple voices into
+        // one centroid, so it must never create a phantom speaker nor drift an
+        // existing one.  Identify-only against the nearest table entry.
+        const bool identify_only =
+            wav_path.size() >= 8 &&
+            wav_path.compare(wav_path.size() - 8, 8, ".raw.wav") == 0;
+        if (identify_only) {
+            params.max_speakers = 0;
+            params.min_update_sec = 1e9f;
+        }
+        result.speakers = table->AssignOnline(centroids, c1::EMB_DIM, weights,
+                                              params, now);
+    } else {
+        result.speakers = table->Assign(centroids, c1::EMB_DIM, weights,
+                                        options.speaker_match_threshold, now);
+    }
     if (!parts.empty()) table->Save(options.table_path);
 
     result.parts = std::move(parts);
@@ -275,6 +316,14 @@ int main(int argc, char** argv) {
                      options.model_dir.c_str(), options.table_path.c_str(),
                      options.step_sec, options.speaker_match_threshold,
                      options.omp_threads, table.size());
+        if (options.assign_mode == "online") {
+            std::fprintf(stderr,
+                         "[diar] online assign: hungarian min_new=%.1fs "
+                         "min_update=%.1fs max_speakers=%d\n",
+                         options.online_min_new_sec,
+                         options.online_min_update_sec,
+                         options.online_max_speakers);
+        }
 
         if (options.oneshot) return RunOneshot(&engine, &table, options);
         if (!WriteFrame(response_fd, 'R', "ready")) return 1;

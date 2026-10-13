@@ -25,6 +25,67 @@ float Cosine(const std::vector<float>& a, const float* b, int dim) {
     return (float)(dot / (std::sqrt(aa * bb) + 1e-12));
 }
 
+// Speaker-cluster similarity: max cosine over the speaker's recent samples
+// and its running mean.  Keeping the max over individual samples is more
+// robust to drift than a single mean for long meetings.
+float SpeakerSimilarity(const Speaker& speaker, const float* center, int dim) {
+    float best = -1.0f;
+    for (const auto& sample : speaker.samples) {
+        if (sample.size() != static_cast<std::size_t>(dim)) continue;
+        const float score = Cosine(sample, center, dim);
+        if (score > best) best = score;
+    }
+    if (speaker.center.size() == static_cast<std::size_t>(dim)) {
+        const float score = Cosine(speaker.center, center, dim);
+        if (score > best) best = score;
+    }
+    return best;
+}
+
+// Compact O(n^3) Hungarian algorithm (rectangular: n rows <= m columns) on
+// the cost matrix `cost` (row-major, n * m).  Returns for each row the
+// assigned column, or -1.  With cluster counts <= 8 and speakers <= 20 this
+// runs in microseconds.
+std::vector<int> Hungarian(const std::vector<float>& cost, int n, int m) {
+    const float kInf = 1e30f;
+    // u/v potentials, p[j] = row assigned to column j, way[j] = previous
+    // column on the alternating path (1-based textbook formulation).
+    std::vector<float> u(n + 1, 0.0f), v(m + 1, 0.0f);
+    std::vector<int> p(m + 1, 0), way(m + 1, 0);
+    for (int i = 1; i <= n; ++i) {
+        p[0] = i;
+        int j0 = 0;
+        std::vector<float> minv(m + 1, kInf);
+        std::vector<char> used(m + 1, 0);
+        do {
+            used[j0] = 1;
+            const int i0 = p[j0];
+            float delta = kInf;
+            int j1 = -1;
+            for (int j = 1; j <= m; ++j) {
+                if (used[j]) continue;
+                const float cur = cost[(i0 - 1) * m + (j - 1)] - u[i0] - v[j];
+                if (cur < minv[j]) { minv[j] = cur; way[j] = j0; }
+                if (minv[j] < delta) { delta = minv[j]; j1 = j; }
+            }
+            for (int j = 0; j <= m; ++j) {
+                if (used[j]) { u[p[j]] += delta; v[j] -= delta; }
+                else minv[j] -= delta;
+            }
+            j0 = j1;
+        } while (p[j0] != 0);
+        do {
+            const int j1 = way[j0];
+            p[j0] = p[j1];
+            j0 = j1;
+        } while (j0);
+    }
+    std::vector<int> row_col(n, -1);
+    for (int j = 1; j <= m; ++j)
+        if (p[j] > 0 && p[j] <= n) row_col[p[j] - 1] = j - 1;
+    return row_col;
+}
+
 }  // namespace
 
 void SpeakerTable::Load(const std::string& path) {
@@ -162,6 +223,133 @@ std::vector<std::string> SpeakerTable::Assign(
         speakers_[best].last_seen = now;
         taken[best] = 1;
         ids[index] = speakers_[best].id;
+    }
+    return ids;
+}
+
+std::vector<std::string> SpeakerTable::AssignOnline(
+    const std::vector<float>& centers, int dim,
+    const std::vector<long long>& weights,
+    const OnlineParams& params, long long now) {
+    const int clusters = static_cast<int>(weights.size());
+    std::vector<std::string> ids(clusters);
+    if (clusters <= 0 || dim <= 0 ||
+        centers.size() < static_cast<std::size_t>(clusters) * dim)
+        return ids;
+
+    // Active clusters only: weight 0 means no speech was ever mapped to the
+    // AHC centroid, so its embedding is meaningless.
+    std::vector<int> active;
+    for (int c = 0; c < clusters; ++c)
+        if (weights[c] > 0) active.push_back(c);
+
+    // Step 1: similarity matrix (active clusters x existing speakers).
+    const int n = static_cast<int>(active.size());
+    const int m = static_cast<int>(speakers_.size());
+    std::vector<float> sim(n * m, -1.0f);
+    for (int i = 0; i < n; ++i) {
+        const float* center = centers.data() +
+            static_cast<std::size_t>(active[i]) * dim;
+        for (int j = 0; j < m; ++j)
+            sim[i * m + j] = SpeakerSimilarity(speakers_[j], center, dim);
+    }
+
+    // Step 2: joint optimal assignment on 1 - similarity.  This is the diart
+    // SpeakerMap: one cluster cannot steal a speaker that a better-matching
+    // cluster already claimed (greedy's failure mode with 3+ speakers).
+    std::vector<int> match(n, -1);  // active index -> speaker index
+    if (n > 0 && m > 0) {
+        // Pad with dummy columns so rows <= columns always holds (a chunk can
+        // carry more clusters than the table has speakers early in a
+        // meeting); dummy assignments mean "unmatched".
+        const int cols = std::max(n, m);
+        const float kDummy = 2.0f;  // worse than any 1 - similarity
+        std::vector<float> cost(n * cols, kDummy);
+        for (int i = 0; i < n; ++i)
+            for (int j = 0; j < m; ++j)
+                cost[i * cols + j] = 1.0f - sim[i * m + j];
+        const std::vector<int> row_col = Hungarian(cost, n, cols);
+        for (int i = 0; i < n; ++i) {
+            const int col = row_col[i];
+            // Reject dummy columns and pairs below the similarity threshold.
+            match[i] = (col >= 0 && col < m && sim[i * m + col] >= params.threshold)
+                           ? col : -1;
+        }
+    }
+
+    const long long min_new = static_cast<long long>(
+        params.min_new_sec * params.sample_rate);
+    const long long min_update = static_cast<long long>(
+        params.min_update_sec * params.sample_rate);
+    constexpr std::size_t kMaxSamples = 8;
+
+    for (int i = 0; i < n; ++i) {
+        const int c = active[i];
+        const float* center = centers.data() + static_cast<std::size_t>(c) * dim;
+        const long long weight = weights[c];
+        int best = match[i];
+
+        if (best < 0) {
+            // Unmatched: create a new speaker only with enough speech and a
+            // free slot (rho_update / delta_new gates: "um"/"right" backchannel
+            // fragments must never spawn phantom ids).
+            if (weight >= min_new &&
+                static_cast<int>(speakers_.size()) < params.max_speakers) {
+                Speaker speaker;
+                speaker.id = "speaker-" + std::to_string(next_id_++);
+                speaker.center.assign(center, center + dim);
+                speaker.samples.push_back(std::vector<float>(center, center + dim));
+                speaker.count = weight;
+                speaker.last_seen = now;
+                speakers_.push_back(std::move(speaker));
+                best = static_cast<int>(speakers_.size()) - 1;
+                std::fprintf(stderr,
+                             "[diar] online: created %s weight=%.1fs "
+                             "(no match >= %.2f, %.1fs speech gate passed)\n",
+                             speakers_[best].id.c_str(), weight / 16000.0,
+                             params.threshold, params.min_new_sec);
+            } else {
+                // Table full or too little speech: identify-only against the
+                // nearest existing speaker (diart's fallback), no update.
+                float best_score = -1.0f;
+                for (int j = 0; j < m; ++j) {
+                    if (sim[i * m + j] > best_score) {
+                        best_score = sim[i * m + j];
+                        best = j;
+                    }
+                }
+                if (best >= 0) {
+                    speakers_[best].last_seen = now;
+                    ids[c] = speakers_[best].id;
+                    std::fprintf(stderr,
+                                 "[diar] online: identify-only %s cosine=%.3f "
+                                 "weight=%.1fs (create gated)\n",
+                                 speakers_[best].id.c_str(), best_score,
+                                 weight / 16000.0);
+                    continue;
+                }
+                // No speaker exists at all: leave unlabeled.
+                ids[c] = "";
+                continue;
+            }
+        } else {
+            // Matched above threshold: update the running mean only with
+            // enough speech (tiny fragments cannot drift a centroid).
+            if (weight >= min_update) {
+                Speaker& speaker = speakers_[best];
+                const long long previous = std::max<long long>(1, speaker.count);
+                for (int d = 0; d < dim; ++d)
+                    speaker.center[d] = (speaker.center[d] * (float)previous +
+                                         center[d] * (float)weight) /
+                                        (float)(previous + weight);
+                speaker.samples.push_back(std::vector<float>(center, center + dim));
+                if (speaker.samples.size() > kMaxSamples)
+                    speaker.samples.erase(speaker.samples.begin());
+                speaker.count = previous + weight;
+            }
+            speakers_[best].last_seen = now;
+        }
+        ids[c] = speakers_[best].id;
     }
     return ids;
 }

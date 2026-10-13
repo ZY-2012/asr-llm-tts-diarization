@@ -12,9 +12,17 @@
   （`speaker_id`/`sample_count`/`last_seen_time`/`embedding_center`），
   256 维中心余弦匹配；每个说话人同时保留最近 8 个分段质心并取最大余弦，
   `speaker-N` 编号跨段保持稳定。默认匹配阈值 0.55（多人长会议建议 0.5–0.65 间微调）。
+  `AssignOnline()` 提供 diart 式在线聚类决策层：块内全部簇与说话人表做
+  匈牙利整体最优分配（带哑列补齐），新说话人创建/质心更新带语音量门控
+  （对应 diart 的 rho_update/delta_new 思想），说话人总数封顶。
 - `src/diar_worker.cpp`：常驻 worker。协议与 `qwen3-worker` 相同
   （stdin 收请求长度+WAV 路径，fd 3 回 `R`/`E` 帧；启动回 `R ready`）。
   也支持单机调试：`diar-worker --model DIR --wav in.wav [--out out.rttm]`。
+  `--assign greedy|online` 选择决策层（默认 greedy，即原逐簇贪心，segment/session
+  模式行为不变）；online 模式额外参数：`--min-new-sec`（新说话人语音门控，默认 2.0）、
+  `--update-min-sec`（质心更新门控，默认 1.0）、`--max-speakers`（封顶，默认 20）。
+  逐段回退请求（pipeline 命名的 `*.raw.wav`）在 online 模式下只识别不建新、
+  不更新质心（混合质心无出生权）。
 - `tools/label_transcript.cpp`：**独立评测工具** `build/label-transcript`，
   输入一段 WAV，输出带秒级时间戳与说话人标签的可读转录：
 

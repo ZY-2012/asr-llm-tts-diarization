@@ -102,6 +102,10 @@ struct AppConfig {
     // "segment": run the resident worker per VAD segment (lowest latency).
     // "session": for file inputs, diarize the whole source once at startup and
     // map the resulting speaker timeline onto VAD segments (best quality).
+    // "online": like "session" transport-wise (streaming chunks for realtime
+    // inputs, whole file for batch), but the worker assigns cluster ids with
+    // diart-style online clustering: joint Hungarian matching, speech-gated
+    // speaker creation and centroid updates, and a speaker-count cap.
     std::string mode = "segment";
     // Resident pyannote community-1 worker; the model directory must contain
     // the eight axmodels plus fbank/frontend/ffn/powerset/embtail/plda bin
@@ -122,6 +126,15 @@ struct AppConfig {
     // How long a segment may wait for the session timeline to cover it before
     // falling back to per-segment diarization (0 = never wait).
     float session_max_wait_sec = 180.0f;
+    // "online" mode only: seconds of speech a cluster must carry before it
+    // may create a new speaker id (rho_update / delta_new gate; stops "um"/
+    // "right" backchannel fragments from spawning phantom speakers).
+    float online_min_new_speech_sec = 2.0f;
+    // "online" mode only: seconds of speech a matched cluster needs before it
+    // updates the speaker's running centroid.
+    float online_update_min_sec = 1.0f;
+    // "online" mode only: hard cap on global speakers in the table.
+    int online_max_speakers = 20;
   } diarization;
 
   struct Asr {

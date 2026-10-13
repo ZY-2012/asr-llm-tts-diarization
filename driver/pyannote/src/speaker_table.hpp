@@ -37,6 +37,30 @@ class SpeakerTable {
                                     const std::vector<long long>& weights,
                                     float threshold, long long now);
 
+    // diart-style online assignment for the realtime "online" mode.  Instead
+    // of greedy per-cluster matching it solves the whole batch jointly:
+    //   1. build a similarity matrix cluster x speaker (max cosine over the
+    //      speaker's recent samples and running mean),
+    //   2. run a Hungarian assignment on 1 - similarity,
+    //   3. accept pairs at or above `threshold`,
+    //   4. unmatched clusters only create a new speaker when they carry at
+    //      least `min_new_sec` seconds of speech and the table is not full,
+    //      otherwise they fall back to the nearest existing speaker
+    //      (identify-only, no centroid update),
+    //   5. matched clusters update the running mean only when they carry at
+    //      least `min_update_sec` seconds of speech.
+    struct OnlineParams {
+        float threshold = 0.55f;
+        float min_new_sec = 2.0f;     // speech needed before creating an id
+        float min_update_sec = 1.0f;  // speech needed to move a centroid
+        int max_speakers = 20;
+        int sample_rate = 16000;
+    };
+    std::vector<std::string> AssignOnline(
+        const std::vector<float>& centers, int dim,
+        const std::vector<long long>& weights,
+        const OnlineParams& params, long long now);
+
     std::size_t size() const { return speakers_.size(); }
     const std::vector<Speaker>& speakers() const { return speakers_; }
 
