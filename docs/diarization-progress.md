@@ -152,18 +152,36 @@ ASR 文本量稳定/略增，无退化信号。建议上板用现场录音复核
 
 ## 6. 计划与待办
 
-### P0 实时流式跨块 ID 一致性（进行中，必须）
+### P0 实时流式跨块 ID 一致性（已完成，2026-10-13）
 
-问题：T3 中每块聚类正确（4/3 簇），但块间表匹配把同一人拆成新 ID（出现 6 个）。候选方案：
+结论：幻影 ID 的根因不是块间表匹配，而是**关闭竞态**——文件结束时
+`SessionDiarizer::Stop()` 的 notify 把等待最后一块时间线的话段全部误判为
+"等待超时"，回退逐段 raw 推理，混合质心匹配不到任何人而新建 speaker-5/6；
+最后一块的 12s NPU 结果反而作废。修复（`framework/audio_pipeline.cpp`）：
 
-1. **表匹配调参**：流式场景降低 `speaker_match_threshold`（0.55 → 0.45~0.5），
-   观察 T3 的 ID 数、conf 变化；
-2. **块间全局对齐**：每块结束后把"本块质心 + 表内质心"合并重聚类；或对最近 N 块联合聚类
-   （滚动全局聚类）；
-3. **块间重叠**：每块向前多取 15~30s 上下文参与聚类，只提交核心区间；
-4. 验证：T3（240s）快速迭代 → T1（Ali 全片 26 min）确认。
+- `SessionDiarizer` 增加 `finished_` 终态；`WaitCovered` 只认
+  `committed_ >= end || finished_`（Stop 不再骗醒等待者）；
+- `ResultWorker::Close` 顺序改为 Stop → ProcessRemaining → Finish，
+  `session_` 生命周期延长到结果线程 join 之后（消除释放竞态）。
 
-验收：T3/T1 说话人 ID 数 = 实际人数，conf ≤ 5%，无等待超时堆积。
+决策层升级（`speaker_table.cpp` `AssignOnline`，diart 式，`mode: online` 启用）：
+匈牙利整体最优分配 + 新建门控 `online_min_new_speech_sec` + 更新门控
+`online_update_min_sec` + 封顶 `online_max_speakers`；逐段回退请求
+（`.raw.wav`）identify-only，混合质心无出生权。
+
+实测：
+
+| 场景 | 指标 | 旧二进制 session | 新二进制 session | 新二进制 online |
+|---|---|---|---|---|
+| T3（Ali 240s，4 人，流式） | IDs / conf / DER | 6 / 21.83% / 57.47% | 4 / 9.54% / 45.18% | **4 / 9.54% / 45.18%** |
+| 2P（20200327，32.6 min，2 人，流式） | IDs | — | — | **2（全程 17 块零幻影）** |
+
+2P 全程（`build/3dspk/out/report-2P-online.txt`）：块1 精确建 2 人
+（47.8s + 72.2s），后续 16 块全部静默匹配；说话占比 55.9%，与 v8 离线
+基线说话人一致率 90%（真实错分 ~53s ≈ 4.9%，其余为 VAD 覆盖差异）；
+转录按 part 输出 278 行（`label-2P-online.txt`），逐轮抽查与 v8 标签一致。
+T3 的簇余弦普遍 0.89–1.00，贪心与匈牙利决策无差异；online 决策层的价值
+在质心漂移 / 短附和 / 开放麦封顶等难场景。
 
 ### P1 完整实时验证
 
