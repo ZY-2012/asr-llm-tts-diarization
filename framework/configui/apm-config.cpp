@@ -241,6 +241,12 @@ bool ValidateAppConfig(const AppConfig& c, std::string* error) {
     *error = "VAD max accumulation must be greater than min accumulation plus trailing silence";
     return false;
   }
+  if (c.vad.preview_seconds < 0.0f ||
+      (c.vad.preview_seconds > 0.0f &&
+       c.vad.preview_seconds >= c.vad.max_segment_seconds)) {
+    *error = "VAD preview_seconds must be 0 (off) or less than max_segment_seconds";
+    return false;
+  }
   if (c.diarization.speaker_match_threshold < -1.0f ||
       c.diarization.speaker_match_threshold > 1.0f ||
       c.diarization.step_sec <= 0.0f || c.diarization.step_sec > 10.0f ||
@@ -427,7 +433,7 @@ bool LoadAppConfig(const std::string& path,
       "vad.enabled", "vad.model_path", "vad.library", "vad.npu_core",
       "vad.input_buffer_ms", "vad.hop_ms", "vad.threshold", "vad.min_speech_ms",
       "vad.min_segment_seconds", "vad.max_segment_seconds",
-      "vad.trailing_silence_seconds",
+      "vad.trailing_silence_seconds", "vad.preview_seconds",
       "diarization.enabled", "diarization.logging_enabled",
       "diarization.mode",
       "diarization.runner", "diarization.model_path",
@@ -530,6 +536,7 @@ bool LoadAppConfig(const std::string& path,
   GET_NUM("vad.min_segment_seconds", c->vad.min_segment_seconds);
   GET_NUM("vad.max_segment_seconds", c->vad.max_segment_seconds);
   GET_NUM("vad.trailing_silence_seconds", c->vad.trailing_silence_seconds);
+  GET_NUM("vad.preview_seconds", c->vad.preview_seconds);
   GET_BOOL("diarization.enabled", c->diarization.enabled);
   GET_BOOL("diarization.logging_enabled", c->diarization.logging_enabled);
   GET_STRING("diarization.mode", c->diarization.mode);

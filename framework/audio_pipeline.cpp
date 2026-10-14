@@ -455,6 +455,10 @@ struct Segment {
   std::vector<int16_t> raw_samples;
   std::size_t raw_start = 0;
   std::vector<Part> parts;
+  // Streaming first-word fast path: a short "preview" slice emitted early by
+  // the accumulator so the ASR can produce opening text before the speaker
+  // label is available.  Previews skip diarization entirely.
+  bool is_preview = false;
   WallClock::time_point wall_start, wall_end;
 };
 
@@ -466,6 +470,9 @@ class Accumulator {
         min_segment_(std::max(1, static_cast<int>(std::lround(c.vad.min_segment_seconds * kRateOut)))),
         max_(std::max(1, static_cast<int>(std::lround(c.vad.max_segment_seconds * kRateOut)))),
         trailing_(std::max(1, static_cast<int>(std::lround(c.vad.trailing_silence_seconds * kRateOut)))),
+        preview_(c.vad.preview_seconds > 0.0f
+                     ? std::max(1, static_cast<int>(std::lround(c.vad.preview_seconds * kRateOut)))
+                     : 0),
         submit_(std::move(submit)),
         start_wall_(WallClock::now()) {
     std::cerr << "[vad] accumulator min=" << min_segment_ / static_cast<double>(kRateOut)
@@ -504,6 +511,15 @@ class Accumulator {
       have_voice_ = true;
       in_voice_ = true;
       const size_t total = buffer_.size() + burst_.size();
+      // Streaming fast path: once `preview_` voiced samples have accumulated
+      // (and the segment has not yet hit its max), emit a text-only preview so
+      // the ASR can produce opening words without waiting for the speaker
+      // label.  Emitted once per segment.
+      if (!preview_sent_ && preview_ > 0 &&
+          total >= static_cast<size_t>(preview_) &&
+          total < static_cast<size_t>(max_)) {
+        EmitPreview();
+      }
       if (total >= static_cast<size_t>(max_)) {
         if (buffer_.empty()) start_ = burst_start_;
         buffer_.insert(buffer_.end(), burst_.begin(), burst_.end());
@@ -527,6 +543,7 @@ class Accumulator {
           runs_.clear();
           raw_.clear();
           raw_active_ = false;
+          preview_sent_ = false;
         }
         burst_.clear();
         // A trailing-silence boundary completes the current utterance.  The
@@ -538,8 +555,26 @@ class Accumulator {
     }
     cursor_ += hop.size();
   }
-  void Flush() { if (burst_.size() >= static_cast<size_t>(min_burst_)) { if (buffer_.empty()) start_ = burst_start_; buffer_.insert(buffer_.end(), burst_.begin(), burst_.end()); } else { runs_.clear(); raw_.clear(); raw_active_ = false; } if (!buffer_.empty()) Emit(); burst_.clear(); }
+  void Flush() { if (burst_.size() >= static_cast<size_t>(min_burst_)) { if (buffer_.empty()) start_ = burst_start_; buffer_.insert(buffer_.end(), burst_.begin(), burst_.end()); } else { runs_.clear(); raw_.clear(); raw_active_ = false; preview_sent_ = false; } if (!buffer_.empty()) Emit(); burst_.clear(); }
  private:
+  // Text-only fast path: emit a short preview of the accumulated voiced audio
+  // so the ASR can produce opening words before the speaker label is known.
+  void EmitPreview() {
+    preview_sent_ = true;
+    Segment p;
+    p.is_preview = true;
+    p.start = buffer_.empty() ? burst_start_ : start_;
+    p.end = last_voice_;
+    p.samples = buffer_;
+    p.samples.insert(p.samples.end(), burst_.begin(), burst_.end());
+    p.wall_start = start_wall_ + std::chrono::milliseconds(
+        static_cast<int64_t>(p.start) * 1000 / kRateOut);
+    p.wall_end = start_wall_ + std::chrono::milliseconds(
+        static_cast<int64_t>(p.end) * 1000 / kRateOut);
+    std::cerr << "[vad] preview submitted duration="
+              << p.samples.size() / static_cast<double>(kRateOut) << "s\n";
+    submit_(std::move(p));
+  }
   void Emit() {
     if (buffer_.empty()) return;
     Segment s;
@@ -567,8 +602,9 @@ class Accumulator {
     // the next voiced hop establish a fresh start offset and end timestamp.
     in_voice_ = false;
     have_voice_ = false;
+    preview_sent_ = false;
   }
-  int min_burst_, min_segment_, max_, trailing_; std::function<void(Segment)> submit_; WallClock::time_point start_wall_; std::vector<int16_t> buffer_, burst_; std::vector<std::size_t> join_points_; std::vector<std::pair<std::size_t, std::size_t>> runs_; std::vector<int16_t> raw_; std::size_t raw_start_ = 0; bool raw_active_ = false; size_t start_ = 0, burst_start_ = 0, cursor_ = 0, last_voice_ = 0; bool in_voice_ = false, have_voice_ = false;
+  int min_burst_, min_segment_, max_, trailing_, preview_; std::function<void(Segment)> submit_; WallClock::time_point start_wall_; std::vector<int16_t> buffer_, burst_; std::vector<std::size_t> join_points_; std::vector<std::pair<std::size_t, std::size_t>> runs_; std::vector<int16_t> raw_; std::size_t raw_start_ = 0; bool raw_active_ = false; size_t start_ = 0, burst_start_ = 0, cursor_ = 0, last_voice_ = 0; bool in_voice_ = false, have_voice_ = false, preview_sent_ = false;
 };
 
 bool WriteWav(const fs::path& path, const std::vector<int16_t>& samples, int rate) {
@@ -749,6 +785,12 @@ std::string SpeakerTimeStamp(WallClock::time_point t) {
   const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()) % 1000;
   std::ostringstream out; out << std::put_time(&tm, "%y%m%d_%H-%M-%S-")
       << std::setfill('0') << std::setw(3) << ms.count(); return out.str();
+}
+
+// Streaming transcript sidecar: "transcript.txt" -> "transcript_streaming.txt".
+std::string DeriveStreamingTextFile(const std::string& text_file) {
+  const fs::path p(text_file);
+  return (p.parent_path() / (p.stem().string() + "_streaming" + p.extension().string())).string();
 }
 
 class SenseVoiceRunner {
@@ -2203,6 +2245,7 @@ class ResultWorker {
         jobs_(static_cast<std::size_t>(std::max(0, c.llm.queue_capacity))) {
     fs::create_directories(c_.output.temp_dir);
     fs::create_directories(c_.output.mp3_dir);
+    streaming_text_file_ = DeriveStreamingTextFile(c_.output.text_file);
     const std::string configured = FindExecutable(c_.output.mp3_encoder);
     if (!configured.empty() && fs::path(configured).filename() == "lame") {
       encoder_ = configured;
@@ -2328,6 +2371,28 @@ class ResultWorker {
   void Loop() {
     Segment s;
     while (jobs_.Pop(&s)) {
+      // Streaming fast path: text-only preview slice, transcribed immediately
+      // so the opening words land at ~preview_seconds.  No speaker label (that
+      // still arrives with the normal segment ~10 s later); the preview is
+      // written to the streaming transcript and skips diarization + MP3.
+      if (s.is_preview) {
+        const std::string stamp =
+            TimeStamp(s.wall_start) + "_" + TimeStamp(s.wall_end);
+        const fs::path preview_wav =
+            fs::path(c_.output.temp_dir) / (stamp + ".preview.wav");
+        if (WriteWav(preview_wav, s.samples, kRateOut)) {
+          auto cell = npu2_arbiter_->Acquire();
+          const std::string text = asr_.Transcribe(preview_wav);
+          if (!streaming_text_file_.empty()) {
+            std::ofstream stxt(streaming_text_file_, std::ios::app);
+            stxt << "pending@" << SpeakerTimeStamp(s.wall_start) << " "
+                 << text << "\n";
+          }
+          std::cerr << "[asr] preview text: " << text << "\n";
+          RemoveWav(preview_wav);
+        }
+        continue;
+      }
       const std::string stamp = TimeStamp(s.wall_start) + "_" + TimeStamp(s.wall_end);
       const fs::path wav = fs::path(c_.output.temp_dir) / (stamp + ".wav");
       if (!WriteWav(wav, s.samples, kRateOut)) {
@@ -2472,6 +2537,7 @@ class ResultWorker {
   std::vector<Segment::Part> session_parts_;
   std::unique_ptr<SessionDiarizer> session_;
   bool session_ready_ = false;
+  std::string streaming_text_file_;
   std::string encoder_;
   EncoderKind encoder_kind_ = EncoderKind::kNone;
   bool closed_ = false;

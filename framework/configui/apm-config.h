@@ -94,6 +94,13 @@ struct AppConfig {
     // Safety fallback: force a save when a segment grows this long.
     float max_segment_seconds = 30.0f;
     float trailing_silence_seconds = 3.0f;
+    // Streaming first-word fast path (0 = off).  When > 0, the accumulator
+    // emits a short "preview" segment as soon as this much voiced audio has
+    // accumulated, so the ASR can produce the opening text at ~preview_seconds
+    // without waiting for the speaker label (which lands ~10 s later, after
+    // the diarization window commits).  The preview is text-only (no speaker);
+    // the normal segment flow still attaches the speaker later.
+    float preview_seconds = 0.0f;
   } vad;
 
   struct Diarization {
