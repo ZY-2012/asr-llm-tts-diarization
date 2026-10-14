@@ -527,11 +527,18 @@ class Accumulator {
         preview_(c.vad.preview_seconds > 0.0f
                      ? std::max(1, static_cast<int>(std::lround(c.vad.preview_seconds * kRateOut)))
                      : 0),
+        pause_split_(c.vad.pause_split_seconds > 0.0f
+                         ? std::max(1, static_cast<int>(std::lround(c.vad.pause_split_seconds * kRateOut)))
+                         : 0),
+        pause_len_(std::max(1, kRateOut * 3 / 10)),
         submit_(std::move(submit)),
         start_wall_(WallClock::now()) {
     std::cerr << "[vad] accumulator min=" << min_segment_ / static_cast<double>(kRateOut)
               << "s max=" << max_ / static_cast<double>(kRateOut)
-              << "s trailing=" << trailing_ / static_cast<double>(kRateOut) << "s\n";
+              << "s trailing=" << trailing_ / static_cast<double>(kRateOut)
+              << "s pause_split=" << (pause_split_ > 0
+                  ? std::to_string(pause_split_ / static_cast<double>(kRateOut)) + "s"
+                  : std::string("off")) << "\n";
   }
   void Push(const std::vector<int16_t>& hop, bool voiced) {
     if (voiced) {
@@ -584,11 +591,21 @@ class Accumulator {
       if (raw_active_) raw_.insert(raw_.end(), hop.begin(), hop.end());
       in_voice_ = false;
       const size_t total = buffer_.size() + burst_.size();
+      const size_t since_voice = cursor_ + hop.size() - last_voice_;
       // Do not start the silence timer until the accumulated speech has
       // reached the configured minimum.  Once it has, a trailing-silence hop
       // closes and submits the utterance immediately.
-      if (!burst_.empty() && total >= static_cast<size_t>(min_segment_) &&
-          cursor_ + hop.size() - last_voice_ >= static_cast<size_t>(trailing_)) {
+      const bool close_end = !burst_.empty() &&
+          total >= static_cast<size_t>(min_segment_) &&
+          since_voice >= static_cast<size_t>(trailing_);
+      // Long-monologue split: once the segment is past pause_split_, a short
+      // natural pause (>= 0.3 s) is enough to close it, instead of waiting
+      // for the full trailing silence or the hard max-length cut (which can
+      // land mid-word and garble the ASR at both sides of the cut).
+      const bool close_split = !burst_.empty() && pause_split_ > 0 &&
+          total >= static_cast<size_t>(pause_split_) &&
+          since_voice >= static_cast<size_t>(pause_len_);
+      if (close_end || close_split) {
         if (burst_.size() >= static_cast<size_t>(min_burst_)) {
           if (buffer_.empty()) start_ = burst_start_;
           buffer_.insert(buffer_.end(), burst_.begin(), burst_.end());
@@ -659,7 +676,7 @@ class Accumulator {
     have_voice_ = false;
     preview_sent_ = false;
   }
-  int min_burst_, min_segment_, max_, trailing_, preview_; std::function<void(Segment)> submit_; WallClock::time_point start_wall_; std::vector<int16_t> buffer_, burst_; std::vector<std::size_t> join_points_; std::vector<std::pair<std::size_t, std::size_t>> runs_; std::vector<int16_t> raw_; std::size_t raw_start_ = 0; bool raw_active_ = false; size_t start_ = 0, burst_start_ = 0, cursor_ = 0, last_voice_ = 0; bool in_voice_ = false, have_voice_ = false, preview_sent_ = false;
+  int min_burst_, min_segment_, max_, trailing_, preview_, pause_split_, pause_len_; std::function<void(Segment)> submit_; WallClock::time_point start_wall_; std::vector<int16_t> buffer_, burst_; std::vector<std::size_t> join_points_; std::vector<std::pair<std::size_t, std::size_t>> runs_; std::vector<int16_t> raw_; std::size_t raw_start_ = 0; bool raw_active_ = false; size_t start_ = 0, burst_start_ = 0, cursor_ = 0, last_voice_ = 0; bool in_voice_ = false, have_voice_ = false, preview_sent_ = false;
 };
 
 bool WriteWav(const fs::path& path, const std::vector<int16_t>& samples, int rate) {
