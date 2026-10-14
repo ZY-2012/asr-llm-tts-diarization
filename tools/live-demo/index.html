@@ -59,9 +59,9 @@ const PAL = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b'];
 const REFPAL = ['#9ecae1','#fdae6b','#a1d99b','#fc9272'];
 let S = null, es = null, raf = 0;
 function reset(){
-  if (S && S.tw) S.tw.forEach(clearInterval);
   S = {t0:null, frozen:null, diar:[], cov:0, prev:[], fin:[], ref:[], peaks:null, pps:50,
-       spk:{}, rspk:{}, firstPrev:null, firstFin:null, lats:[], running:false, tw:[]};
+       spk:{}, rspk:{}, firstPrev:null, firstFin:null, lats:[], running:false};
+  ['final','prev'].forEach(id => { const el = $(id); if (el._typing) { clearTimeout(el._typing.timer); el._typing = null; } el._lastArrive = null; el._estGap = null; });
   $('final').innerHTML = ''; $('prev').innerHTML = '';
 }
 function color(map, pal, id){ if(!(id in map)) map[id] = pal[Object.keys(map).length % pal.length]; return map[id]; }
@@ -86,7 +86,16 @@ function addLine(el, html){ const div = document.createElement('div'); div.class
 // Typewriter line: reveal the body text char-by-char over ~1s while the
 // prefix (speaker stamp / time range) shows immediately.  Purely cosmetic
 // streaming - the underlying events are unchanged.
+// Finish the line currently typing in this panel instantly (used when the
+// next line arrives early, and on reset).
+function completeTyping(el){ const t = el._typing; if (!t) return;
+  clearTimeout(t.timer); t.body.textContent = t.ch.join(''); el._typing = null; }
+// Typewriter line: reveal the body text char-by-char, paced to the panel's
+// recent line cadence so a line usually finishes typing just before the next
+// one lands; a line interrupted by the next one completes instantly instead
+// of overlapping.  Purely cosmetic - the underlying events are unchanged.
 function addTypedLine(el, prefix, text, cls, suffix){
+  completeTyping(el);
   const div = document.createElement('div'); div.className = 'ln';
   const stamp = document.createElement('span'); stamp.className = 'tm'; stamp.innerHTML = prefix;
   const body = document.createElement('span'); body.className = cls || '';
@@ -94,13 +103,20 @@ function addTypedLine(el, prefix, text, cls, suffix){
   if (suffix) { const sfx = document.createElement('span'); sfx.innerHTML = suffix; div.appendChild(sfx); }
   const stick = () => { if (el.scrollTop + el.clientHeight >= el.scrollHeight - 26) el.scrollTop = el.scrollHeight; };
   el.appendChild(div); stick();
+  const at = performance.now();
+  const prevArrive = el._lastArrive; el._lastArrive = at;
+  if (prevArrive && at - prevArrive > 120) el._estGap = at - prevArrive;  // ignore bursts
   if (!$('typer').checked || !text) { body.textContent = text; stick(); return; }
   const ch = Array.from(text);
-  const dur = Math.min(900, Math.max(250, ch.length * 28));  // ms, feels like typing
-  const per = Math.max(10, dur / ch.length);
+  const est = Math.min(6000, Math.max(600, el._estGap || 1500));
+  const dur = Math.min(4500, Math.max(400, est * 0.9));  // aim to finish just before the next line
+  const per = Math.max(12, dur / ch.length);
   let i = 0;
-  const tick = () => { body.textContent = ch.slice(0, ++i).join(''); stick();
-    if (i < ch.length) S.tw.push(setTimeout(tick, per)); };
+  el._typing = { body, ch, timer: 0 };
+  const tick = () => { if (!el._typing || el._typing.body !== body) return;
+    body.textContent = ch.slice(0, ++i).join(''); stick();
+    if (i < ch.length) el._typing.timer = setTimeout(tick, per);
+    else el._typing = null; };
   tick();
 }
 function esc(s){ return s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'})[c]); }
