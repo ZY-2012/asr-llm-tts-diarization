@@ -174,24 +174,28 @@ function paintLiveStamp(ln){
   ln.spk = spks;
   ln.stamp.innerHTML = stampHTML(spks, ln.b, ln.e);
 }
-// Authoritative view of a row: every final assigned to it splices in one
-// colored text segment; the stamp shows all of their speakers and the row's
-// full span.  Deterministic and echo-free: each final belongs to one row.
-// Active rows (S.st) are skipped - they keep streaming until epoch close.
+// Authoritative view of a row: one line per assigned final - speaker,
+// [b–e], text and per-final lag, exactly the transcript format.  A
+// cross-speaker epoch therefore splits into several colored lines at its
+// original feed position.  Deterministic and echo-free: each final belongs
+// to one row.  Active rows (S.st) are skipped - they keep streaming until
+// epoch close.
 function renderAuthRow(r){
   if (r === S.st) return;
   const fs = S.fin.filter(x => x._row === r).sort((a, b) => a.b - b.b);
   if (!fs.length) return;
-  const spks = [...new Set(fs.map(x => x.spk))];
-  r.stamp.innerHTML = stampHTML(spks, r.b, Math.max(r.e ?? r.b, fs[fs.length - 1].e));
-  r.solid.innerHTML = fs.map(x =>
-    '<span style="color:' + (x.spk ? color(S.spk, PAL, x.spk) : '#666') + '">' +
-    esc(x.text) + '</span>').join(' ');
-  if (r.tail) r.tail.textContent = '';
-  let lat = r.div.querySelector('.lat');
-  if (!lat) { lat = document.createElement('span'); lat.className = 'lat'; r.div.appendChild(lat); }
-  lat.textContent = ' +' + (fs[fs.length - 1].t - fs[0].e).toFixed(1) + 's';
   r.auth = true;
+  r.div.className = '';            // becomes a wrapper holding one line per final
+  r.div.innerHTML = '';
+  for (const f of fs) {
+    const c = f.spk ? color(S.spk, PAL, f.spk) : '#666';
+    const line = document.createElement('div'); line.className = 'ln';
+    line.innerHTML = '<span class="tm"><b style="color:' + c + '">' + esc(f.spk || '?') +
+      '</b> <span>[' + clock(f.b) + '–' + clock(f.e) + ']</span> </span>' +
+      '<span class="ssolid" style="color:' + c + '">' + esc(f.text) + '</span>' +
+      '<span class="lat"> +' + (f.t - f.e).toFixed(1) + 's</span>';
+    r.div.appendChild(line);
+  }
   feedStick();
 }
 // Reconcile on every final event: legacy preview lines (tick=0) are absorbed
@@ -235,12 +239,8 @@ function reconcile(f){
 function insertFinalRow(f){
   const el = $('feed');
   completeTyping(el);
-  const div = document.createElement('div'); div.className = 'ln';
-  const stamp = document.createElement('span'); stamp.className = 'tm';
-  const solid = document.createElement('span'); solid.className = 'ssolid';
-  const lat = document.createElement('span'); lat.className = 'lat';
-  div.appendChild(stamp); div.appendChild(solid); div.appendChild(lat);
-  const ln = { key: f.b, b: f.b, e: f.e, div, stamp, solid, tail: null, spk: null, auth: false };
+  const div = document.createElement('div');   // wrapper; renderAuthRow fills it
+  const ln = { key: f.b, b: f.b, e: f.e, div, stamp: null, solid: null, tail: null, spk: null, auth: false };
   div._ln = ln; S.rows.push(ln);
   let ref = null;
   for (const child of el.children) { const r = child._ln; if (r && r.b > f.b) { ref = child; break; } }
