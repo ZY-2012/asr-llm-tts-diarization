@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>实时说话人分离 + ASR 演示</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:16px;background:#fafafa;color:#222}
+#bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+button,select{font-size:14px;padding:4px 10px}
+#stats{display:grid;grid-template-columns:repeat(6,auto);gap:4px 18px;margin:10px 0;font-size:13px}
+#stats b{font-weight:600}
+canvas{width:100%;height:260px;background:#fff;border:1px solid #ddd}
+#cols{display:flex;gap:12px;margin-top:10px}
+#final,#prev{flex:1;height:340px;overflow:auto;background:#fff;border:1px solid #ddd;padding:6px;font-size:14px}
+#prev{flex:0.6;color:#777}
+.ln{margin:2px 0}.tm{color:#888;font-size:12px}.lat{color:#c60;font-size:12px}
+.sr-only{position:absolute;left:-9999px}
+</style>
+</head>
+<body>
+<h2>实时说话人分离 + ASR（模拟麦克风输入）</h2>
+<div id="bar">
+  <label for="input">音频</label>
+  <select id="input"><option value="60">2P 前 60s</option><option value="full">2P 全片 33 分钟</option></select>
+  <button id="startBtn">开始</button>
+  <button id="stopBtn">停止</button>
+  <label><input type="checkbox" id="mute"> 静音</label>
+  <span id="status" role="status" aria-live="polite">空闲</span>
+</div>
+<div id="stats" aria-label="延迟统计">
+  <span>播放位置 <b id="sNow">-</b></span>
+  <span>说话人覆盖到 <b id="sCov">-</b></span>
+  <span>说话人滞后 <b id="sLag">-</b></span>
+  <span>首个预览文字 <b id="sPrev">-</b></span>
+  <span>首个说话人+文字 <b id="sFirst">-</b></span>
+  <span>说话人+文字平均延迟 <b id="sAvg">-</b></span>
+</div>
+<canvas id="cv" width="1400" height="260" aria-label="时间轴：参考标注、说话人输出、文字、波形；红线为当前时刻"></canvas>
+<div id="cols">
+  <div id="final" aria-label="正式结果（说话人+文字）" aria-live="off"></div>
+  <div id="prev" aria-label="预览文字（无说话人）"></div>
+</div>
+<audio id="au" preload="auto"></audio>
+<script>
+const $ = id => document.getElementById(id);
+const au = $('au'), cv = $('cv'), ctx = cv.getContext('2d');
+const PAL = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b'];
+const REFPAL = ['#9ecae1','#fdae6b','#a1d99b','#fc9272'];
+let S = null, es = null, raf = 0;
+function reset(){
+  S = {t0:null, diar:[], cov:0, prev:[], fin:[], ref:[], peaks:null, pps:50,
+       spk:{}, rspk:{}, firstPrev:null, firstFin:null, lats:[], running:false};
+  $('final').innerHTML = ''; $('prev').innerHTML = '';
+}
+function color(map, pal, id){ if(!(id in map)) map[id] = pal[Object.keys(map).length % pal.length]; return map[id]; }
+function now(){ return S && S.t0 !== null ? (performance.now() - S.t0) / 1000 : 0; }
+function fmt(x){ return x === null || x === undefined ? '-' : x.toFixed(1) + 's'; }
+function clock(x){ const m = Math.floor(x / 60), s = x - m * 60; return m + ':' + s.toFixed(1).padStart(4, '0'); }
+async function loadWave(input){
+  try {
+    const buf = await (await fetch('/audio?input=' + input)).arrayBuffer();
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    const ab = await ac.decodeAudioData(buf);
+    const d = ab.getChannelData(0), step = Math.floor(ab.sampleRate / S.pps);
+    const p = new Float32Array(Math.ceil(d.length / step));
+    for (let i = 0; i < p.length; i++) { let m = 0; const e = Math.min(d.length, (i + 1) * step);
+      for (let j = i * step; j < e; j++) { const v = Math.abs(d[j]); if (v > m) m = v; } p[i] = m; }
+    S.peaks = p; ac.close();
+  } catch (e) { console.warn('waveform', e); }
+}
+function addLine(el, html){ const div = document.createElement('div'); div.className = 'ln'; div.innerHTML = html;
+  const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 20; el.appendChild(div); if (stick) el.scrollTop = el.scrollHeight; }
+function esc(s){ return s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'})[c]); }
+function onEvent(ev){
+  if (ev.ev === 'status') { S.running = ev.running;
+    $('status').textContent = ev.running ? (S.t0 === null ? '加载模型中… ' + ev.since + 's' : '运行中') : (S.t0 === null ? '空闲' : '已结束');
+    return; }
+  if (ev.ev === 'start') { S.t0 = performance.now(); au.currentTime = 0; au.muted = $('mute').checked; au.play().catch(()=>{}); return; }
+  if (S.t0 === null) return;
+  // SSE is polled every 0.1 s: never let the page clock lag the board clock.
+  if (ev.t > now()) S.t0 = performance.now() - ev.t * 1000;
+  if (ev.ev === 'diar') { S.diar.push(...ev.parts.map(p => ({b:p[0], e:p[1], spk:p[2], t:ev.t}))); S.cov = Math.max(S.cov, ev.core[1]); }
+  else if (ev.ev === 'preview') { S.prev.push(ev); if (S.firstPrev === null) S.firstPrev = ev.t;
+    addLine($('prev'), `<span class="tm">${clock(ev.b)} 出于 ${clock(ev.t)}</span> ${esc(ev.text)}`); }
+  else if (ev.ev === 'final') { S.fin.push(ev); if (S.firstFin === null) S.firstFin = ev.t; S.lats.push(ev.t - ev.e);
+    const c = ev.spk ? color(S.spk, PAL, ev.spk) : '#666';
+    addLine($('final'), `<b style="color:${c}">${esc(ev.spk || '?')}</b> <span class="tm">[${clock(ev.b)}–${clock(ev.e)}]</span> ${esc(ev.text)} <span class="lat">+${(ev.t - ev.e).toFixed(1)}s</span>`); }
+  else if (ev.ev === 'end') { au.pause(); }
+}
+const SPAN = 30;  // seconds visible; "now" sits at 85% of the width
+function draw(){
+  raf = requestAnimationFrame(draw);
+  const W = cv.width, H = cv.height, n = now(), L = 90, PW = W - L;
+  const x1 = n + SPAN * 0.15, x0 = x1 - SPAN, X = t => L + (t - x0) / SPAN * PW;
+  ctx.clearRect(0, 0, W, H); ctx.font = '13px sans-serif';
+  const rows = [['参考标注', 10], ['说话人输出', 70], ['文字', 130], ['波形', 190]];
+  rows.forEach(([name, y]) => { ctx.fillStyle = '#444'; ctx.fillText(name, 6, y + 28); ctx.fillStyle = '#f3f3f3'; ctx.fillRect(L, y, PW, 50); });
+  const bar = (b, e, y, h, c) => { const a = Math.max(X(b), L), z = Math.min(X(e), W); if (z > a) { ctx.fillStyle = c; ctx.fillRect(a, y, z - a, h); } };
+  // reference: only what has already been heard
+  for (const r of S.ref) if (r[0] < n) bar(r[0], Math.min(r[1], n), 15, 40, color(S.rspk, REFPAL, r[2]));
+  for (const d of S.diar) bar(d.b, d.e, 75, 40, color(S.spk, PAL, d.spk));
+  // unlabeled gap between the coverage frontier and now
+  if (n > S.cov) { ctx.fillStyle = 'rgba(0,0,0,0.08)'; const a = Math.max(X(S.cov), L); ctx.fillRect(a, 70, X(n) - a, 50);
+    ctx.fillStyle = '#999'; ctx.fillText('待标注', Math.max(a + 4, L + 4), 100); }
+  for (const p of S.prev) bar(p.b, p.e, 155, 18, 'rgba(120,120,120,0.35)');
+  for (const f of S.fin) bar(f.b, f.e, 135, 18, f.spk ? color(S.spk, PAL, f.spk) : '#666');
+  if (S.peaks) { ctx.fillStyle = '#7a8ca3'; const i0 = Math.max(0, Math.floor(x0 * S.pps)), i1 = Math.min(S.peaks.length, Math.floor(n * S.pps));
+    for (let i = i0; i < i1; i++) { const h = S.peaks[i] * 48; ctx.fillRect(X(i / S.pps), 215 - h / 2, Math.max(1, PW / SPAN / S.pps), h); } }
+  ctx.strokeStyle = '#3367d6'; ctx.setLineDash([5, 4]); ctx.beginPath(); ctx.moveTo(X(S.cov), 64); ctx.lineTo(X(S.cov), 124); ctx.stroke(); ctx.setLineDash([]);
+  ctx.strokeStyle = '#d00'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(X(n), 0); ctx.lineTo(X(n), H); ctx.stroke(); ctx.lineWidth = 1;
+  ctx.fillStyle = '#666';
+  for (let t = Math.ceil(x0 / 5) * 5; t < x1; t += 5) if (t >= 0) ctx.fillText(clock(t), X(t) - 14, H - 4);
+  $('sNow').textContent = S.t0 === null ? '-' : clock(n);
+  $('sCov').textContent = S.t0 === null ? '-' : clock(S.cov);
+  $('sLag').textContent = S.t0 === null ? '-' : fmt(Math.max(0, n - S.cov));
+  $('sPrev').textContent = fmt(S.firstPrev); $('sFirst').textContent = fmt(S.firstFin);
+  $('sAvg').textContent = S.lats.length ? fmt(S.lats.reduce((a, b) => a + b, 0) / S.lats.length) : '-';
+}
+function connect(){
+  if (es) es.close();
+  es = new EventSource('/events');
+  es.onmessage = m => { try { onEvent(JSON.parse(m.data)); } catch (e) { console.warn(e); } };
+}
+$('startBtn').onclick = async () => {
+  const input = $('input').value; reset();
+  au.src = '/audio?input=' + input; au.load();
+  // play()+pause() inside the click keeps autoplay permission for the delayed start
+  au.muted = true; au.play().then(() => au.pause()).catch(() => {});
+  S.ref = await (await fetch('/ref?limit=' + (input === '60' ? 60 : 1e9))).json();
+  loadWave(input);
+  const r = await fetch('/start?input=' + input, {method: 'POST'});
+  const j = await r.json(); $('status').textContent = j.msg;
+  if (j.ok) connect();
+};
+$('stopBtn').onclick = async () => { await fetch('/stop', {method: 'POST'}); au.pause(); };
+$('mute').onchange = () => { au.muted = $('mute').checked; };
+reset(); draw();
+fetch('/status').then(r => r.json()).then(s => { if (s.running) { $('status').textContent = '有任务在运行，已接入'; connect(); } });
+</script>
+</body>
+</html>

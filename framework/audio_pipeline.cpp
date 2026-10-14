@@ -439,6 +439,60 @@ class Decimator {
   size_t phase_ = 0;
 };
 
+// JSON-lines event stream for the live demo viewer (tools/live-demo).  Every
+// line carries `t` = seconds since the first input sample reached the
+// pipeline, so a viewer can compare emit time against audio time.
+class EventLog {
+ public:
+  static EventLog& Get() { static EventLog log; return log; }
+  void Open(const std::string& path) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (path.empty()) return;
+    out_.open(path, std::ios::trunc);
+  }
+  void MarkStart() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (started_) return;
+    started_ = true;
+    t0_ = std::chrono::steady_clock::now();
+    if (!out_.is_open()) return;
+    const double epoch = std::chrono::duration<double>(
+        WallClock::now().time_since_epoch()).count();
+    out_ << "{\"ev\":\"start\",\"t\":0,\"epoch\":" << std::fixed
+         << std::setprecision(3) << epoch << "}\n" << std::flush;
+  }
+  // `body` is the JSON object content without braces and without "t".
+  void Write(const std::string& ev, const std::string& body) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!out_.is_open()) return;
+    const double t = started_ ? std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0_).count() : 0.0;
+    out_ << "{\"ev\":\"" << ev << "\",\"t\":" << std::fixed
+         << std::setprecision(3) << t << "," << body << "}\n" << std::flush;
+  }
+  static std::string Quote(const std::string& s) {
+    std::string o = "\"";
+    for (unsigned char ch : s) {
+      if (ch == '"') o += "\\\"";
+      else if (ch == '\\') o += "\\\\";
+      else if (ch == '\n') o += "\\n";
+      else if (ch < 0x20) { char b[8]; std::snprintf(b, sizeof(b), "\\u%04x", ch); o += b; }
+      else o += static_cast<char>(ch);
+    }
+    return o + "\"";
+  }
+  static std::string Sec(std::size_t samples, int rate) {
+    char b[32];
+    std::snprintf(b, sizeof(b), "%.3f", samples / static_cast<double>(rate));
+    return b;
+  }
+ private:
+  std::mutex mutex_;
+  std::ofstream out_;
+  bool started_ = false;
+  std::chrono::steady_clock::time_point t0_;
+};
+
 struct Segment {
   struct Part { std::size_t begin = 0, end = 0; std::string speaker_id; };
   size_t start = 0, end = 0;
@@ -563,7 +617,8 @@ class Accumulator {
     preview_sent_ = true;
     Segment p;
     p.is_preview = true;
-    p.start = buffer_.empty() ? burst_start_ : start_;
+    p.start = !runs_.empty() ? runs_.front().second
+                             : (buffer_.empty() ? burst_start_ : start_);
     p.end = last_voice_;
     p.samples = buffer_;
     p.samples.insert(p.samples.end(), burst_.begin(), burst_.end());
@@ -666,6 +721,18 @@ bool WriteParts(const fs::path& wav, const std::vector<Segment::Part>& parts) {
 // 0.3 s and degrades beyond it (threshold sweep in the eval assets).
 constexpr std::size_t kMinPartSamples = kRateOut * 3 / 10;  // 0.3 s
 
+// Concatenated (voiced-only) offset -> absolute source offset via `runs`.
+// `is_end` maps an exclusive end so it never jumps into the next run.
+std::size_t ConcatToSource(
+    const std::vector<std::pair<std::size_t, std::size_t>>& runs,
+    std::size_t concat, bool is_end) {
+  if (runs.empty()) return concat;
+  const std::size_t probe = (is_end && concat > 0) ? concat - 1 : concat;
+  std::size_t r = 0;
+  while (r + 1 < runs.size() && runs[r + 1].first <= probe) ++r;
+  return runs[r].second + (probe - runs[r].first) + ((is_end && concat > 0) ? 1 : 0);
+}
+
 // P2c ASR slice pad: a part boundary that lands inside a word onset leaves the
 // ASR with the tail of the word only.  In the 2P run the second turn was cut
 // at source 2.080 s, about 20 ms into the "可" burst (rms 823 at 2.06 s), and
@@ -678,6 +745,23 @@ constexpr std::size_t kMinPartSamples = kRateOut * 3 / 10;  // 0.3 s
 // unpadded bounds — only the ASR input grows, so labeling and DER scoring are
 // unaffected.
 constexpr std::size_t kAsrPadSamples = kRateOut / 5;  // 0.2 s
+
+// Largest concatenated prefix whose source samples are already covered by the
+// time line frontier (source samples with final speaker labels).
+std::size_t ConcatCoveredBySource(
+    const std::vector<std::pair<std::size_t, std::size_t>>& runs,
+    std::size_t frontier, std::size_t trimmed_samples) {
+  std::size_t cut = 0;
+  for (std::size_t r = 0; r < runs.size(); ++r) {
+    const std::size_t concat = runs[r].first;
+    const std::size_t source = runs[r].second;
+    if (source >= frontier) break;
+    const std::size_t concat_end =
+        (r + 1 < runs.size()) ? runs[r + 1].first : trimmed_samples;
+    cut = concat + std::min(concat_end - concat, frontier - source);
+  }
+  return std::min(cut, trimmed_samples);
+}
 
 std::vector<Segment::Part> MapTimelineToTrimmed(
     const std::vector<Segment::Part>& timeline,
@@ -2051,6 +2135,17 @@ class SessionDiarizer {
     return committed_ >= end;
   }
 
+  // Timeline frontier: every source sample below this has a final label.
+  std::size_t Committed() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return committed_;
+  }
+
+  bool Finished() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return finished_;
+  }
+
   // Waits until the timeline covers `end`; false on timeout or once the
   // final chunk has committed without covering it (Finish).  Input closure
   // alone (Stop) does NOT end the wait: the final chunk's timeline is still
@@ -2187,7 +2282,7 @@ class SessionDiarizer {
     }
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      for (auto& entry : commit) timeline_.push_back(std::move(entry));
+      for (const auto& entry : commit) timeline_.push_back(entry);
       std::stable_sort(timeline_.begin(), timeline_.end(),
                        [](const Segment::Part& a, const Segment::Part& b) {
                          return a.begin < b.begin;
@@ -2207,6 +2302,17 @@ class SessionDiarizer {
                 << "s) parts=" << commit.size()
                 << " committed=" << committed_ / kRateOut
                 << "s wall=+" << wall << "s\n";
+    }
+    {
+      std::string body = "\"core\":[" + EventLog::Sec(core_begin, kRateOut) +
+                         "," + EventLog::Sec(core_end, kRateOut) + "],\"parts\":[";
+      for (std::size_t i = 0; i < commit.size(); ++i) {
+        if (i) body += ",";
+        body += "[" + EventLog::Sec(commit[i].begin, kRateOut) + "," +
+                EventLog::Sec(commit[i].end, kRateOut) + "," +
+                EventLog::Quote(commit[i].speaker_id) + "]";
+      }
+      EventLog::Get().Write("diar", body + "]");
     }
     ready_.notify_all();
   }
@@ -2246,6 +2352,9 @@ class ResultWorker {
     fs::create_directories(c_.output.temp_dir);
     fs::create_directories(c_.output.mp3_dir);
     streaming_text_file_ = DeriveStreamingTextFile(c_.output.text_file);
+    if (!c_.output.text_file.empty())
+      EventLog::Get().Open(
+          (fs::path(c_.output.text_file).parent_path() / "events.jsonl").string());
     const std::string configured = FindExecutable(c_.output.mp3_encoder);
     if (!configured.empty() && fs::path(configured).filename() == "lame") {
       encoder_ = configured;
@@ -2358,6 +2467,7 @@ class ResultWorker {
     }
     jobs_.Close();
     if (thread_.joinable()) thread_.join();
+    EventLog::Get().Write("end", "\"abort\":" + std::string(abort ? "true" : "false"));
     session_.reset();
     diarrer_.Close();
     // Models are loaded Hojo -> Qwen -> SenseVoice. Release them in reverse
@@ -2389,6 +2499,10 @@ class ResultWorker {
                  << text << "\n";
           }
           std::cerr << "[asr] preview text: " << text << "\n";
+          EventLog::Get().Write("preview",
+              "\"b\":" + EventLog::Sec(s.start, kRateOut) +
+              ",\"e\":" + EventLog::Sec(s.end, kRateOut) +
+              ",\"text\":" + EventLog::Quote(text));
           RemoveWav(preview_wav);
         }
         continue;
@@ -2405,29 +2519,17 @@ class ResultWorker {
         std::cerr << "[save] join-point file failed: " << wav << ".joins.txt\n";
       if (!WriteRuns(wav, s.runs))
         std::cerr << "[save] run-map file failed: " << wav << ".runs.txt\n";
+      fs::create_directories(fs::path(c_.output.text_file).parent_path());
+      std::ofstream txt(c_.output.text_file, std::ios::app);
+      bool streamed = false;
       if (diarrer_.active() || session_ready_ || session_) {
         bool labeled = false;
-        // Streaming session mode: wait a bounded time for the chunked timeline
-        // to cover this segment, then map it onto the ASR timeline.
-        if (session_ && !s.runs.empty()) {
-          const std::size_t segment_end =
-              s.runs.back().second + (s.samples.size() - s.runs.back().first);
-          bool covered = session_->Covers(segment_end);
-          if (!covered && c_.diarization.session_max_wait_sec > 0.0f) {
-            covered = session_->WaitCovered(
-                segment_end,
-                std::chrono::milliseconds(static_cast<std::int64_t>(
-                    c_.diarization.session_max_wait_sec * 1000.0f)));
-            if (!covered)
-              std::cerr << "[diar] session timeline wait timed out for " << wav
-                        << "; per-segment fallback\n";
-          }
-          if (covered) {
-            s.parts = MapTimelineToTrimmed(session_->Timeline(), 0, s.runs,
-                                           s.samples.size());
-            labeled = !s.parts.empty();
-          }
-        }
+        // Plan B: release every speaker part to ASR the moment the timeline
+        // covers it instead of waiting for the whole segment (see
+        // StreamSessionParts).
+        if (session_ && !s.runs.empty())
+          streamed = StreamSessionParts(s, stamp, wav, txt);
+        labeled = streamed;
         // Whole-file session pre-run (batch file inputs).
         if (!labeled && session_ready_ && !s.runs.empty()) {
           s.parts = MapTimelineToTrimmed(session_parts_, 0, s.runs,
@@ -2456,14 +2558,16 @@ class ResultWorker {
           std::cerr << "[diar] no speaker parts for " << wav
                     << "; whole-segment ASR fallback\n";
       }
-      fs::create_directories(fs::path(c_.output.text_file).parent_path());
-      std::ofstream txt(c_.output.text_file, std::ios::app);
       if (s.parts.empty()) {
         auto cell = npu2_arbiter_->Acquire();
         const std::string text = asr_.Transcribe(wav);
         txt << "[" << TimeStamp(s.wall_start) << " --> " << TimeStamp(s.wall_end) << "] " << text << "\n";
+        EventLog::Get().Write("final",
+            "\"b\":" + EventLog::Sec(s.start, kRateOut) +
+            ",\"e\":" + EventLog::Sec(s.end, kRateOut) +
+            ",\"spk\":\"\",\"text\":" + EventLog::Quote(text));
         llm_.ProcessAsrResult(text);
-      } else {
+      } else if (!streamed) {
         // Speaker parts are ASR-only slices.  The original VAD WAV below is
         // still the sole input to MP3 encoding, so speaker labeling cannot
         // change the established audio archival behavior.  Each slice reaches
@@ -2472,25 +2576,13 @@ class ResultWorker {
         // deliberately overlaps the previous part's tail — the clipped onset
         // samples live there — and 0.2 s is short enough not to pull the
         // previous speaker's words into the transcript.
-        for (std::size_t i = 0; i < s.parts.size(); ++i) {
-          const auto& part = s.parts[i];
-          const std::size_t begin = std::min(part.begin, s.samples.size());
-          const std::size_t end = std::min(std::max(part.end, begin), s.samples.size());
-          if (end <= begin) continue;
-          const std::size_t slice_begin =
-              begin > kAsrPadSamples ? begin - kAsrPadSamples : 0;
-          std::vector<int16_t> pcm(s.samples.begin() + slice_begin, s.samples.begin() + end);
-          const auto part_start = s.wall_start + std::chrono::milliseconds(static_cast<int64_t>(begin) * 1000 / kRateOut);
-          const fs::path part_wav = fs::path(c_.output.temp_dir) / (stamp + "." + std::to_string(i) + ".wav");
-          if (!WriteWav(part_wav, pcm, kRateOut)) continue;
-          auto cell = npu2_arbiter_->Acquire();
-          const std::string text = asr_.Transcribe(part_wav);
-          txt << part.speaker_id << "@" << SpeakerTimeStamp(part_start)
-              << " " << text << "\n";
-          llm_.ProcessAsrResult(text);
-          RemoveWav(part_wav);
-        }
+        for (std::size_t i = 0; i < s.parts.size(); ++i)
+          TranscribePart(s, stamp, i, s.parts[i].begin, s.parts[i].end,
+                         s.parts[i].speaker_id, txt);
       }
+      if (streamed)
+        std::cerr << "[save] transcript saved (streamed, " << s.parts.size()
+                  << " parts)\n";
       if (encoder_.empty()) {
         std::cerr << "[save] transcript saved; MP3 skipped because no encoder is available\n";
         RemoveWav(wav);
@@ -2516,6 +2608,90 @@ class ResultWorker {
       }
     }
   }
+  // ASR on one speaker part [begin, end) of the concatenated segment.  The
+  // slice reaches back by kAsrPadSamples (see there); `index` only names the
+  // temporary WAV.
+  void TranscribePart(const Segment& s, const std::string& stamp,
+                      std::size_t index, std::size_t part_begin,
+                      std::size_t part_end, const std::string& speaker,
+                      std::ofstream& txt) {
+    const std::size_t begin = std::min(part_begin, s.samples.size());
+    const std::size_t end = std::min(std::max(part_end, begin), s.samples.size());
+    if (end <= begin) return;
+    const std::size_t slice_begin =
+        begin > kAsrPadSamples ? begin - kAsrPadSamples : 0;
+    std::vector<int16_t> pcm(s.samples.begin() + slice_begin, s.samples.begin() + end);
+    const auto part_start = s.wall_start + std::chrono::milliseconds(static_cast<int64_t>(begin) * 1000 / kRateOut);
+    const fs::path part_wav = fs::path(c_.output.temp_dir) / (stamp + "." + std::to_string(index) + ".wav");
+    if (!WriteWav(part_wav, pcm, kRateOut)) return;
+    std::string text;
+    {
+      auto cell = npu2_arbiter_->Acquire();
+      text = asr_.Transcribe(part_wav);
+    }
+    txt << speaker << "@" << SpeakerTimeStamp(part_start) << " " << text << "\n";
+    txt.flush();
+    EventLog::Get().Write("final",
+        "\"b\":" + EventLog::Sec(ConcatToSource(s.runs, begin, false), kRateOut) +
+        ",\"e\":" + EventLog::Sec(ConcatToSource(s.runs, end, true), kRateOut) +
+        ",\"spk\":" + EventLog::Quote(speaker) +
+        ",\"text\":" + EventLog::Quote(text));
+    llm_.ProcessAsrResult(text);
+    RemoveWav(part_wav);
+  }
+
+  // Plan B (docs/realtime-pipeline-timing.md §6): release each speaker part to
+  // ASR as soon as the session timeline covers it instead of waiting for the
+  // whole segment.  A part is released once it is closed, i.e. it ends at
+  // least kMinPartSamples before the covered prefix so later commits cannot
+  // re-merge or absorb it; the rest is released once the segment is fully
+  // covered, using the same mapping as before.  Returns false when nothing
+  // was released (caller falls back to the per-segment paths).
+  bool StreamSessionParts(Segment& s, const std::string& stamp,
+                          const fs::path& wav, std::ofstream& txt) {
+    const std::size_t n = s.samples.size();
+    const std::size_t segment_end =
+        s.runs.back().second + (n - s.runs.back().first);
+    const auto deadline = Clock::now() + std::chrono::milliseconds(
+        static_cast<std::int64_t>(c_.diarization.session_max_wait_sec * 1000.0f));
+    std::vector<Segment::Part> released;
+    std::size_t done = 0;  // concat offset already transcribed
+    auto release = [&](std::size_t b, std::size_t e, const std::string& spk) {
+      b = std::max(b, done);
+      if (e <= b) return;
+      TranscribePart(s, stamp, released.size(), b, e, spk, txt);
+      released.push_back({b, e, spk});
+      done = e;
+    };
+    while (true) {
+      const std::size_t frontier = session_->Committed();
+      const auto parts = MapTimelineToTrimmed(session_->Timeline(), 0, s.runs, n);
+      if (frontier >= segment_end) {
+        for (const auto& p : parts) release(p.begin, p.end, p.speaker_id);
+        break;
+      }
+      const std::size_t cut = ConcatCoveredBySource(s.runs, frontier, n);
+      for (std::size_t i = 0; i + 1 < parts.size(); ++i) {
+        if (parts[i].end + kMinPartSamples > cut) break;
+        release(parts[i].begin, parts[i].end, parts[i].speaker_id);
+      }
+      const auto now = Clock::now();
+      if (session_->Finished() || now >= deadline ||
+          c_.diarization.session_max_wait_sec <= 0.0f) {
+        std::cerr << "[diar] session timeline wait timed out for " << wav
+                  << "; released " << released.size() << " parts early\n";
+        if (released.empty()) return false;
+        // Partial coverage: finish with the best mapping available.
+        for (const auto& p : parts) release(p.begin, p.end, p.speaker_id);
+        break;
+      }
+      session_->WaitCovered(frontier + 1,
+          std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now));
+    }
+    s.parts = std::move(released);
+    return !s.parts.empty();
+  }
+
   static void RemoveWav(const fs::path& wav) {
     std::error_code ec;
     if (fs::remove(wav, ec)) {
@@ -2560,7 +2736,7 @@ class Pipeline {
   void Run() { child_ = StartApm(config_, config_path_); std::thread monitor; if (config_.fastenhance.monitor_enabled || config_.hojo_tts.enabled) monitor = std::thread([this] { MonitorLoop(); }); std::vector<int16_t> raw(kRateIn / 100); while (!g_stop.load() && ReadAll(child_.out, raw.data(), raw.size() * sizeof(int16_t))) Process(raw); monitor_queue_.Close(); const int child_status = StopChild(&child_); if (monitor.joinable()) monitor.join(); const bool interrupted = g_stop.load(); Close(interrupted); if (!interrupted && (child_status == -1 || !WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0)) throw std::runtime_error("APM input process exited with an error"); }
   void Close(bool abort = false) { if (closed_) return; closed_ = true; if (!abort) { if (!enhance_remainder_.empty()) { const size_t n = enhance_remainder_.size(); enhance_remainder_.resize(kEnhanceHop, 0); std::vector<int16_t> tail = enhance_remainder_; enhance_remainder_.clear(); Process(tail); (void)n; } if (!vad_remainder_.empty()) { vad_remainder_.resize(vad_.Hop(), 0); if (BatchInput()) vad_jobs_.Push(vad_remainder_); else vad_jobs_.TryPush(vad_remainder_); vad_remainder_.clear(); } } vad_jobs_.Close(); if (vad_thread_.joinable()) vad_thread_.join(); if (!abort) accumulator_.Flush(); results_.Close(abort); enhancer_.Report(); vad_.Report(); }
  private:
-  void Process(const std::vector<int16_t>& input) { { auto diar_down = diar_decimator_.Process(input); diar_remainder_.insert(diar_remainder_.end(), diar_down.begin(), diar_down.end()); while (diar_remainder_.size() >= static_cast<size_t>(vad_.Hop())) { std::vector<int16_t> d(diar_remainder_.begin(), diar_remainder_.begin() + vad_.Hop()); diar_remainder_.erase(diar_remainder_.begin(), diar_remainder_.begin() + vad_.Hop()); results_.AppendSessionSamples(d); } } enhance_remainder_.insert(enhance_remainder_.end(), input.begin(), input.end()); while (enhance_remainder_.size() >= kEnhanceHop) { std::array<int16_t, kEnhanceHop> hop{}; std::copy_n(enhance_remainder_.begin(), kEnhanceHop, hop.begin()); enhance_remainder_.erase(enhance_remainder_.begin(), enhance_remainder_.begin() + kEnhanceHop); auto output = enhancer_.Process(hop); std::vector<int16_t> rendered(output.begin(), output.end()); if (!monitor_queue_.TryPush(rendered)) { monitor_queue_.TryDropOldest(); monitor_queue_.TryPush(std::move(rendered)); } std::vector<int16_t> enhanced(output.begin(), output.end()); auto down = decimator_.Process(enhanced); vad_remainder_.insert(vad_remainder_.end(), down.begin(), down.end()); while (vad_remainder_.size() >= static_cast<size_t>(vad_.Hop())) { std::vector<int16_t> v(vad_remainder_.begin(), vad_remainder_.begin() + vad_.Hop()); vad_remainder_.erase(vad_remainder_.begin(), vad_remainder_.begin() + vad_.Hop()); if (BatchInput()) vad_jobs_.Push(std::move(v)); else if (!vad_jobs_.TryPush(v)) { vad_jobs_.TryDropOldest(); vad_jobs_.TryPush(std::move(v)); } } } }
+  void Process(const std::vector<int16_t>& input) { EventLog::Get().MarkStart(); { auto diar_down = diar_decimator_.Process(input); diar_remainder_.insert(diar_remainder_.end(), diar_down.begin(), diar_down.end()); while (diar_remainder_.size() >= static_cast<size_t>(vad_.Hop())) { std::vector<int16_t> d(diar_remainder_.begin(), diar_remainder_.begin() + vad_.Hop()); diar_remainder_.erase(diar_remainder_.begin(), diar_remainder_.begin() + vad_.Hop()); results_.AppendSessionSamples(d); } } enhance_remainder_.insert(enhance_remainder_.end(), input.begin(), input.end()); while (enhance_remainder_.size() >= kEnhanceHop) { std::array<int16_t, kEnhanceHop> hop{}; std::copy_n(enhance_remainder_.begin(), kEnhanceHop, hop.begin()); enhance_remainder_.erase(enhance_remainder_.begin(), enhance_remainder_.begin() + kEnhanceHop); auto output = enhancer_.Process(hop); std::vector<int16_t> rendered(output.begin(), output.end()); if (!monitor_queue_.TryPush(rendered)) { monitor_queue_.TryDropOldest(); monitor_queue_.TryPush(std::move(rendered)); } std::vector<int16_t> enhanced(output.begin(), output.end()); auto down = decimator_.Process(enhanced); vad_remainder_.insert(vad_remainder_.end(), down.begin(), down.end()); while (vad_remainder_.size() >= static_cast<size_t>(vad_.Hop())) { std::vector<int16_t> v(vad_remainder_.begin(), vad_remainder_.begin() + vad_.Hop()); vad_remainder_.erase(vad_remainder_.begin(), vad_remainder_.begin() + vad_.Hop()); if (BatchInput()) vad_jobs_.Push(std::move(v)); else if (!vad_jobs_.TryPush(v)) { vad_jobs_.TryDropOldest(); vad_jobs_.TryPush(std::move(v)); } } } }
   void VadLoop() { std::vector<int16_t> hop; while (vad_jobs_.Pop(&hop)) { bool voiced = true; try { voiced = vad_.Process(hop); } catch (const std::exception& e) { std::cerr << "[ten-vad] " << e.what() << "\n"; } accumulator_.Push(hop, voiced); } }
   void MonitorLoop() { std::vector<int16_t> hop; while (!g_stop.load() && monitor_queue_.Pop(&hop)) { playback_mixer_.Mix(&hop, config_.fastenhance.monitor_enabled); if (!WriteAll(child_.in, hop.data(), hop.size() * sizeof(int16_t))) break; } }
   bool BatchInput() const { return config_.runtime.input == "file" && config_.runtime.file_input_mode == "batch"; }
