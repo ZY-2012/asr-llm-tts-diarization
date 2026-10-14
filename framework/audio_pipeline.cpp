@@ -542,7 +542,10 @@ class Accumulator {
         pause_split_(c.vad.pause_split_seconds > 0.0f
                          ? std::max(1, static_cast<int>(std::lround(c.vad.pause_split_seconds * kRateOut)))
                          : 0),
-        pause_len_(std::max(1, kRateOut * 3 / 10)),
+        // Word-safe pause length: real inter-word gaps measured on the 2P
+        // clip are >= ~190 ms while VAD flicker inside words stays < 100 ms,
+        // so 200 ms separates the two; slice cut points land on it.
+        pause_len_(std::max(1, kRateOut / 5)),
         submit_(std::move(submit)),
         start_wall_(WallClock::now()) {
     std::cerr << "[vad] accumulator min=" << min_segment_ / static_cast<double>(kRateOut)
@@ -551,7 +554,12 @@ class Accumulator {
               << "s pause_split=" << (pause_split_ > 0
                   ? std::to_string(pause_split_ / static_cast<double>(kRateOut)) + "s"
                   : std::string("off")) << "\n";
-    // First preview slice fires after the first `preview_` voiced samples.
+    // Opening slice: prefer a word-safe pause-cut once half the interval
+    // has voiced audio (measured pauses cluster at 1.2-2.2 s), falling back
+    // to a blind cut after the first full `preview_` voiced samples (fast
+    // first words; the segment starts on a pause so its begin is clean).
+    // Later slices prefer the word-safe pause-cut in the unvoiced branch
+    // and only blind-cut as a fallback after twice the interval.
     if (preview_ > 0) preview_next_ = static_cast<std::size_t>(preview_);
   }
   void Push(const std::vector<int16_t>& hop, bool voiced) {
@@ -586,13 +594,13 @@ class Accumulator {
       have_voice_ = true;
       in_voice_ = true;
       const size_t total = buffer_.size() + burst_.size();
-      // Streaming fast path: every time `preview_` NEW voiced samples have
-      // accumulated past the last emitted preview (and the segment has not
-      // yet hit its max), emit a text-only preview slice so the ASR produces
-      // words continuously at ~preview_seconds granularity, without waiting
-      // for the speaker label (which lands with the normal segment).  The
-      // first slice of a segment starts at its beginning (not at the last
-      // preview end) so openings are not lost.
+      // Streaming fast path (blind-cut fallback): without a pause, a slice
+      // only cuts after twice `preview_` NEW voiced samples past the last
+      // emitted preview (the opening slice uses 1x for fast first words).
+      // Normally the word-safe pause-cut in the unvoiced branch fires first;
+      // this path only keeps text flowing through fully fluent stretches.
+      // The first slice of a segment starts at its beginning (not at the
+      // last preview end) so openings are not lost.
       if (preview_ > 0 && total >= preview_next_ &&
           total < static_cast<size_t>(max_)) {
         EmitPreview();
@@ -615,13 +623,28 @@ class Accumulator {
           total >= static_cast<size_t>(min_segment_) &&
           since_voice >= static_cast<size_t>(trailing_);
       // Long-monologue split: once the segment is past pause_split_, a short
-      // natural pause (>= 0.3 s) is enough to close it, instead of waiting
+      // natural pause (>= 0.2 s) is enough to close it, instead of waiting
       // for the full trailing silence or the hard max-length cut (which can
       // land mid-word and garble the ASR at both sides of the cut).
       const bool close_split = !burst_.empty() && pause_split_ > 0 &&
           total >= static_cast<size_t>(pause_split_) &&
           since_voice >= static_cast<size_t>(pause_len_);
       if (close_end || close_split) {
+        // Word-safe tail slice: the same pause that closes the segment also
+        // closes the pending preview slice, so its text lands ~0.2 s after
+        // the pause instead of waiting for the speaker label (the final
+        // supersedes it 0.4-1.4 s later).  Without this, pause_split would
+        // starve the chained previews: any pause late enough to satisfy the
+        // slice interval already closes the segment.  The opening slice only
+        // needs half the interval: measured pauses cluster at 1.2-2.2 s of
+        // voiced audio, so this cuts there (word-safe and usually EARLIER
+        // than the old fixed 2 s blind cut) instead of mid-word.
+        if (preview_ > 0 && burst_.size() >= static_cast<size_t>(min_burst_) &&
+            total - preview_done_ >=
+                static_cast<size_t>(preview_done_ == 0 ? preview_ / 2
+                                                       : preview_)) {
+          EmitPreview();
+        }
         if (burst_.size() >= static_cast<size_t>(min_burst_)) {
           if (buffer_.empty()) start_ = burst_start_;
           buffer_.insert(buffer_.end(), burst_.begin(), burst_.end());
@@ -638,6 +661,17 @@ class Accumulator {
         // max_ samples had accumulated, so normal utterances shorter than
         // max_segment_seconds stayed queued indefinitely.
         if (!buffer_.empty()) Emit();
+      } else if (preview_ > 0 && !burst_.empty() &&
+                 total - preview_done_ >=
+                     static_cast<size_t>(preview_done_ == 0 ? preview_ / 2
+                                                            : preview_) &&
+                 since_voice >= static_cast<size_t>(pause_len_)) {
+        // Word-safe fast-text cut: the slice interval (half of it for the
+        // opening slice - pauses cluster just before/after the 2 s mark) has
+        // elapsed and the talker paused (>= 0.2 s, the word-safe threshold).
+        // Cut the preview here instead of blind-cutting mid-word: cut points
+        // land on pauses, so both slice sides keep whole words for the ASR.
+        EmitPreview();
       }
     }
     cursor_ += hop.size();
@@ -646,15 +680,20 @@ class Accumulator {
  private:
   // Text-only fast path: emit the next slice of the accumulated voiced audio
   // so the ASR can produce words before the speaker label is known.  Slices
-  // chain through the segment (every preview_ new voiced samples) so fast
-  // text keeps flowing inside long segments instead of stopping after the
-  // opening words.
+  // chain through the segment: each one fires either on a >= 0.2 s pause
+  // (word-safe cut point, preferred) or - if the talker never pauses - as a
+  // blind cut in the voiced branch after twice the interval.
   void EmitPreview() {
     const std::size_t total = buffer_.size() + burst_.size();
     const std::size_t begin = preview_done_;
     const std::size_t end = total;
     preview_done_ = end;
-    preview_next_ = end + static_cast<std::size_t>(preview_);
+    // Word-safe chaining: after any emitted slice the next one only
+    // blind-cuts mid-speech after twice the interval - normally the
+    // pause-cut in the unvoiced branch fires first.  (The ctor/emit reset
+    // keeps 1x for the opening slice: fast first words, and the segment
+    // itself starts on a pause so the slice begin is clean.)
+    preview_next_ = end + 2 * static_cast<std::size_t>(preview_);
     // Chained slices start mid-speech, so pad the ASR input backwards the
     // same 0.2 s the per-speaker parts use; timestamps stay unpadded.
     const std::size_t sample_begin =

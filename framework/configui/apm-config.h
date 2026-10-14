@@ -102,7 +102,7 @@ struct AppConfig {
     // the normal segment flow still attaches the speaker later.
     float preview_seconds = 0.0f;
     // Long-monologue splitting (0 = off).  Once a segment has accumulated this
-    // much voiced audio, any silence of >= 0.3 s closes it immediately instead
+    // much voiced audio, any silence of >= 0.2 s closes it immediately instead
     // of waiting for the full trailing_silence; max_segment_seconds stays the
     // hard cap.  Splits then land on natural pauses (no mid-word cuts for the
     // ASR) and long monologues stream to the ASR piece by piece.
