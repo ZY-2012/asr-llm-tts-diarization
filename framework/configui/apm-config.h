@@ -107,6 +107,18 @@ struct AppConfig {
     // hard cap.  Splits then land on natural pauses (no mid-word cuts for the
     // ASR) and long monologues stream to the ASR piece by piece.
     float pause_split_seconds = 0.0f;
+    // Fixed-cadence streaming text (streaming-slicer).  When tick > 0 the
+    // slicer transcribes a pause-delimited "epoch" of enhanced audio every
+    // tick seconds on a fixed beat (independent of VAD segment closure) and
+    // confirms text via LocalAgreement-2 across consecutive hypotheses, so
+    // fluent monologues keep producing text instead of stalling until the
+    // speaker pauses.  pause = epoch-closing silence length; epoch_max = hard
+    // re-anchor for nonstop monologues.  Events: stext (tick) / sfinal
+    // (epoch close).  The old preview path should stay off when this is on
+    // (duplicate fast text otherwise).
+    float stream_tick_seconds = 0.0f;
+    float stream_pause_seconds = 0.2f;
+    float stream_epoch_max_seconds = 12.0f;
   } vad;
 
   struct Diarization {

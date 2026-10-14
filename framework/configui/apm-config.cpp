@@ -255,6 +255,13 @@ bool ValidateAppConfig(const AppConfig& c, std::string* error) {
              "[min_segment_seconds, max_segment_seconds)";
     return false;
   }
+  if (c.vad.stream_tick_seconds < 0.0f ||
+      c.vad.stream_pause_seconds <= 0.0f ||
+      c.vad.stream_epoch_max_seconds <= c.vad.stream_pause_seconds) {
+    *error = "VAD stream_tick_seconds must be >= 0, stream_pause_seconds > 0 "
+             "and stream_epoch_max_seconds > stream_pause_seconds";
+    return false;
+  }
   if (c.diarization.speaker_match_threshold < -1.0f ||
       c.diarization.speaker_match_threshold > 1.0f ||
       c.diarization.step_sec <= 0.0f || c.diarization.step_sec > 10.0f ||
@@ -442,7 +449,8 @@ bool LoadAppConfig(const std::string& path,
       "vad.input_buffer_ms", "vad.hop_ms", "vad.threshold", "vad.min_speech_ms",
       "vad.min_segment_seconds", "vad.max_segment_seconds",
       "vad.trailing_silence_seconds", "vad.preview_seconds",
-      "vad.pause_split_seconds",
+      "vad.pause_split_seconds", "vad.stream_tick_seconds",
+      "vad.stream_pause_seconds", "vad.stream_epoch_max_seconds",
       "diarization.enabled", "diarization.logging_enabled",
       "diarization.mode",
       "diarization.runner", "diarization.model_path",
@@ -547,6 +555,9 @@ bool LoadAppConfig(const std::string& path,
   GET_NUM("vad.trailing_silence_seconds", c->vad.trailing_silence_seconds);
   GET_NUM("vad.preview_seconds", c->vad.preview_seconds);
   GET_NUM("vad.pause_split_seconds", c->vad.pause_split_seconds);
+  GET_NUM("vad.stream_tick_seconds", c->vad.stream_tick_seconds);
+  GET_NUM("vad.stream_pause_seconds", c->vad.stream_pause_seconds);
+  GET_NUM("vad.stream_epoch_max_seconds", c->vad.stream_epoch_max_seconds);
   GET_BOOL("diarization.enabled", c->diarization.enabled);
   GET_BOOL("diarization.logging_enabled", c->diarization.logging_enabled);
   GET_STRING("diarization.mode", c->diarization.mode);

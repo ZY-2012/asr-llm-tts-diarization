@@ -36,12 +36,13 @@ MAXSEGS = ["10", "5"]
 PSPLITS = ["0", "4", "3"]
 PREVIEWS = ["0", "3", "2", "1"]
 TRAILS = ["1", "0.5"]
+TICKS = ["0", "0.8", "0.5", "1.2"]
 
 state = {"proc": None, "input": None, "launched": 0.0}
 lock = threading.Lock()
 
 
-def make_config(wav, step, maxseg, psplit, preview, trail):
+def make_config(wav, step, maxseg, psplit, preview, trail, tick):
     text = open(TEMPLATE, encoding="utf-8").read()
     text = text.replace("/tmp/der-2pw-inc-preview3", WORK)
     text = re.sub(r"mp3_dir: .*", "mp3_dir: %s/mp3" % WORK, text)
@@ -51,6 +52,11 @@ def make_config(wav, step, maxseg, psplit, preview, trail):
     text = re.sub(r"pause_split_seconds: .*", "pause_split_seconds: %s" % psplit, text)
     text = re.sub(r"preview_seconds: .*", "preview_seconds: %s" % preview, text)
     text = re.sub(r"trailing_silence_seconds: .*", "trailing_silence_seconds: %s" % trail, text)
+    # Streaming slicer: fixed-cadence text (stext/sfinal events).  When on,
+    # force the old pause-gated preview path off (duplicate fast text).
+    text = re.sub(r"stream_tick_seconds: .*", "stream_tick_seconds: %s" % tick, text)
+    if tick != "0":
+        text = re.sub(r"preview_seconds: .*", "preview_seconds: 0", text)
     path = os.path.join(WORK, "config.yaml")
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
@@ -73,7 +79,7 @@ def running():
     return p is not None and p.poll() is None
 
 
-def start(key, step, maxseg, psplit, preview, trail):
+def start(key, step, maxseg, psplit, preview, trail, tick):
     with lock:
         if running():
             return False, "already running"
@@ -82,9 +88,11 @@ def start(key, step, maxseg, psplit, preview, trail):
             return False, "missing input %s" % wav
         if step not in STEPS or maxseg not in MAXSEGS or psplit not in PSPLITS or preview not in PREVIEWS or trail not in TRAILS:
             return False, "bad step/maxseg/psplit/preview/trail"
+        if tick not in TICKS:
+            return False, "bad tick"
         subprocess.run(["rm", "-rf", WORK])
         os.makedirs(os.path.join(WORK, "mp3"), exist_ok=True)
-        cfg = make_config(wav, step, maxseg, psplit, preview, trail)
+        cfg = make_config(wav, step, maxseg, psplit, preview, trail, tick)
         log = open(LOG, "w")
         state["proc"] = subprocess.Popen(
             [os.path.join(REPO, "build/audio-pipeline"), "--config", cfg],
@@ -160,7 +168,8 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/start":
             ok, msg = start(q.get("input", ["60"])[0], q.get("step", ["1"])[0],
                             q.get("maxseg", ["5"])[0], q.get("psplit", ["4"])[0],
-                            q.get("preview", ["2"])[0], q.get("trail", ["0.5"])[0])
+                            q.get("preview", ["2"])[0], q.get("trail", ["0.5"])[0],
+                            q.get("tick", ["0"])[0])
             self.send_json({"ok": ok, "msg": msg}, 200 if ok else 409)
         elif u.path == "/stop":
             ok, msg = stop()

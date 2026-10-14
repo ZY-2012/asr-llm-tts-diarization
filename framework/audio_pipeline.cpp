@@ -196,6 +196,14 @@ class BlockingQueue {
     not_empty_.notify_one();
     return true;
   }
+  bool TryPopValue(T* value) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (q_.empty()) return false;
+    *value = std::move(q_.front());
+    q_.pop_front();
+    not_full_.notify_one();
+    return true;
+  }
   bool Pop(T* value) {
     std::unique_lock<std::mutex> lock(mutex_);
     not_empty_.wait(lock, [&] { return closed_ || !q_.empty(); });
@@ -973,6 +981,7 @@ class SenseVoiceRunner {
     if (!init_ || !uninit_ || !run_) return false;
     handle_ = init_(AX_SENSEVOICE, model_.c_str());
     if (!handle_) { std::cerr << "[asr] AX_ASR_Init(SenseVoice) failed\n"; return false; }
+    run_pcm_ = reinterpret_cast<RunPcm>(dlsym(library_, "AX_ASR_RunPCM"));
     return true;
   }
   std::string Transcribe(const fs::path& wav) {
@@ -982,6 +991,25 @@ class SenseVoiceRunner {
     int status = -1;
     try {
       status = run_(handle_, wav.c_str(), language_.c_str(), &result);
+    } catch (const std::exception& error) {
+      return "[ASR_ERROR] " + std::string(error.what());
+    }
+    if (status != 0 || !result) return "[ASR_ERROR] sensevoice status=" + std::to_string(status);
+    std::string text(result); std::free(result); return text;
+  }
+  // In-memory transcription of 16k mono PCM16 (streaming-slicer tick path;
+  // measured on-board: ~21 ms per second of audio, 3 s window -> ~150 ms).
+  std::string TranscribePcm(const std::vector<int16_t>& pcm) {
+    if (!enabled_) return "";
+    if (!handle_ || !run_pcm_) return "[ASR_ERROR] sensevoice unavailable";
+    static std::vector<float> buf;
+    buf.resize(pcm.size());
+    for (size_t i = 0; i < pcm.size(); ++i) buf[i] = pcm[i] / 32768.0f;
+    char* result = nullptr;
+    int status = -1;
+    try {
+      status = run_pcm_(handle_, buf.data(), static_cast<int>(buf.size()),
+                         kRateOut, language_.c_str(), &result);
     } catch (const std::exception& error) {
       return "[ASR_ERROR] " + std::string(error.what());
     }
@@ -1000,11 +1028,358 @@ class SenseVoiceRunner {
   using Init = AX_ASR_HANDLE (*)(AX_ASR_TYPE_E, const char*);
   using Uninit = void (*)(AX_ASR_HANDLE);
   using Run = int (*)(AX_ASR_HANDLE, const char*, const char*, char**);
+  using RunPcm = int (*)(AX_ASR_HANDLE, float*, int, int, const char*, char**);
   std::string c_library_;
-  void* library_ = nullptr; AX_ASR_HANDLE handle_ = nullptr; Init init_ = nullptr; Uninit uninit_ = nullptr; Run run_ = nullptr;
+  void* library_ = nullptr; AX_ASR_HANDLE handle_ = nullptr; Init init_ = nullptr; Uninit uninit_ = nullptr; Run run_ = nullptr; RunPcm run_pcm_ = nullptr;
   std::string model_, language_;
   pid_t pid_ = -1;
   int in_fd_ = -1, out_fd_ = -1;
+};
+
+// Fixed-cadence streaming text (streaming-slicer refactor).
+//
+// Feeds every enhanced 16k hop (silence included, straight from the VAD hop
+// stream) and produces text on a fixed beat instead of the VAD-segment beat:
+//
+//   epoch  = speech run delimited by silences >= stream_pause_seconds (word
+//            safe cut points; the epoch window [epoch_start, now) only ever
+//            grows, so the left edge never eats a word mid-epoch)
+//   tick   = every stream_tick_seconds of audio inside an epoch the whole
+//            epoch window is re-transcribed in-memory (RunPCM, ~21 ms/s) and
+//            the text is merged with the previous hypothesis
+//   merge  = LocalAgreement-2: the longest common prefix of two consecutive
+//            hypotheses becomes confirmed text (append-only; the remainder is
+//            shown as a provisional tail until the next tick)
+//   final  = when the closing pause is confirmed, the epoch hypothesis is
+//            committed in full (it is the best-quality view of the epoch)
+//
+// Replaces the old preview path's pause-gated output cadence: fluent
+// monologues now produce text every tick instead of stalling 4-5 s until the
+// speaker happens to pause.  Events: "stext" (tick; commit/tail delta) and
+// "sfinal" (epoch close; full authoritative-for-epoch text).
+class StreamSlicer {
+ public:
+  StreamSlicer(const apm_example::AppConfig& c, SenseVoiceRunner* asr,
+               Npu2CellArbiter* arbiter)
+      : enabled_(c.vad.stream_tick_seconds > 0.0f),
+        asr_(asr), arbiter_(arbiter),
+        streaming_text_file_(DeriveStreamingTextFile(c.output.text_file)),
+        tick_(std::max<size_t>(1, static_cast<size_t>(
+            c.vad.stream_tick_seconds * kRateOut))),
+        pause_close_(std::max<size_t>(1, static_cast<size_t>(
+            c.vad.stream_pause_seconds * kRateOut))),
+        epoch_cap_(std::max<size_t>(1, static_cast<size_t>(
+            c.vad.stream_epoch_max_seconds * kRateOut))) {}
+  ~StreamSlicer() { Close(false); }
+
+  void Start() {
+    if (!enabled_ || thread_.joinable()) return;
+    thread_ = std::thread([this] { Loop(); });
+  }
+
+  // Producer side (VAD loop thread).  Hops are queued; the queue never blocks
+  // the VAD pipeline (drops oldest, mirroring the vad_jobs pattern).
+  void Push(const std::vector<int16_t>& hop, bool voiced) {
+    if (!enabled_ || !thread_.joinable()) return;
+    Item item;
+    item.samples = hop;
+    item.voiced = voiced;
+    if (!queue_.TryPush(std::move(item))) {
+      queue_.TryDropOldest();
+      queue_.TryPush(std::move(item));
+    }
+  }
+
+  // End of stream: drain, finalize the open epoch, stop the thread.
+  void FlushAndClose() {
+    if (!enabled_) return;
+    Item flush;
+    flush.flush = true;
+    if (thread_.joinable()) {
+      queue_.Push(std::move(flush));
+      thread_.join();
+    } else {
+      queue_.Close();
+    }
+  }
+  void Close(bool) { FlushAndClose(); }
+
+ private:
+  struct Item {
+    std::vector<int16_t> samples;
+    bool voiced = false;
+    bool flush = false;
+  };
+
+  // ---- UTF-8 helpers for the punctuation-loose LocalAgreement merge ----
+  // SenseVoice jitters on punctuation across overlapping windows ("吧？" ->
+  // "吧" -> "吧？"), which stalls a naive byte-wise common prefix right after
+  // the epoch opening.  The merge therefore compares CONTENT (punctuation
+  // skipped) and commits the newer hypothesis's own bytes (punctuation
+  // included) up to the last stable content character.
+
+  static size_t Utf8Len(unsigned char c) {
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+  }
+
+  static bool IsPunct(const std::string& s, size_t i, size_t len) {
+    const auto c = static_cast<unsigned char>(s[i]);
+    if (len == 1) {
+      return c == ',' || c == '.' || c == '?' || c == '!' || c == ';' ||
+             c == ':' || c == '"' || c == '\'' || c == '(' || c == ')' ||
+             c == '[' || c == ']' || c == '{' || c == '}' || c == '-' ||
+             c == '/' || c == '|';
+    }
+    uint32_t cp = 0;
+    if (len == 2) {
+      cp = ((c & 0x1Fu) << 6) | (static_cast<unsigned char>(s[i + 1]) & 0x3Fu);
+    } else if (len == 3) {
+      cp = ((c & 0x0Fu) << 12) |
+           ((static_cast<unsigned char>(s[i + 1]) & 0x3Fu) << 6) |
+           (static_cast<unsigned char>(s[i + 2]) & 0x3Fu);
+    } else {
+      return false;
+    }
+    return (cp >= 0x3001 && cp <= 0x3002) ||   // 、。
+           (cp >= 0x3008 && cp <= 0x301F) ||   // 〈〉《》「」『』【】…
+           (cp >= 0xFF01 && cp <= 0xFF65) ||   // ，？！：；（）—— fullwidth
+           (cp >= 0x2018 && cp <= 0x201F) ||   // ' ' " "
+           cp == 0x2026 || cp == 0x2014;      // … —
+  }
+
+  static std::string StripPunct(const std::string& s) {
+    std::string out;
+    size_t i = 0;
+    while (i < s.size()) {
+      const size_t l = Utf8Len(static_cast<unsigned char>(s[i]));
+      if (!IsPunct(s, i, l)) out.append(s, i, l);
+      i += l;
+    }
+    return out;
+  }
+
+  // Byte length of the prefix of `b` covering the content both hypotheses
+  // agree on; punctuation inside the agreeing region keeps `b`'s own form.
+  static size_t CommonPrefixLoose(const std::string& a, const std::string& b) {
+    size_t ia = 0, ib = 0, disp = 0;
+    while (ia < a.size() && ib < b.size()) {
+      const size_t la = Utf8Len(static_cast<unsigned char>(a[ia]));
+      const size_t lb = Utf8Len(static_cast<unsigned char>(b[ib]));
+      if (la == lb && a.compare(ia, la, b, ib, lb) == 0) {
+        ia += la; ib += lb; disp = ib;   // identical char (content or punct)
+        continue;
+      }
+      const bool pa = IsPunct(a, ia, la), pb = IsPunct(b, ib, lb);
+      if (pa && pb) { ia += la; ib += lb; continue; }  // both punct: agree to skip
+      if (pa) { ia += la; continue; }
+      if (pb) { ib += lb; continue; }
+      break;                                          // real divergence
+    }
+    return disp;
+  }
+
+  // Byte offset in `hyp` after its content prefix matches `prefix` (already
+  // punctuation-stripped); stops at the first content mismatch.  Used to
+  // split a hypothesis into (confirmed display text, provisional tail).
+  static size_t ContentMatchOffset(const std::string& hyp,
+                                   const std::string& prefix) {
+    size_t i = 0, j = 0;
+    while (j < prefix.size() && i < hyp.size()) {
+      const size_t l = Utf8Len(static_cast<unsigned char>(hyp[i]));
+      if (IsPunct(hyp, i, l)) { i += l; continue; }
+      if (hyp.compare(i, l, prefix, j, l) != 0) break;
+      i += l; j += l;
+    }
+    return i;
+  };
+
+  void Loop() {
+    Item item;
+    while (queue_.Pop(&item)) {
+      if (item.flush) break;
+      abs_ += item.samples.size();
+      Feed(item.samples, item.voiced);
+    }
+    if (item.flush) {
+      // Drain anything still queued, then finalize the open epoch.
+      while (queue_.TryPopValue(&item)) {
+        if (item.flush) continue;
+        abs_ += item.samples.size();
+        Feed(item.samples, item.voiced);
+      }
+      FinalizeEpoch(true);
+      queue_.Close();
+    }
+  }
+
+  void Feed(const std::vector<int16_t>& hop, bool voiced) {
+    if (!in_epoch_) {
+      if (!voiced) return;
+      OpenEpoch();
+    }
+    epoch_.insert(epoch_.end(), hop.begin(), hop.end());
+    if (voiced) {
+      voiced_ += hop.size();
+      silence_ = 0;
+      voiced_end_ = abs_;
+    } else {
+      silence_ += hop.size();
+      if (silence_ >= pause_close_) { FinalizeEpoch(false); return; }
+    }
+    if (epoch_.size() >= epoch_cap_) { FinalizeEpoch(false); return; }
+    if (voiced_ >= min_voiced_ && abs_ >= next_tick_) TickEpoch();
+  }
+
+  void OpenEpoch() {
+    in_epoch_ = true;
+    epoch_.clear();
+    voiced_ = 0;
+    silence_ = 0;
+    voiced_end_ = abs_;
+    confirmed_.clear();
+    tail_.clear();
+    last_hyp_.clear();
+    emitted_text_.clear();
+    emitted_tail_.clear();
+    next_tick_ = abs_ + tick_;
+    epoch_start_ = abs_;
+  }
+
+  // Window handed to the ASR: epoch audio up to the last voiced sample plus a
+  // 0.2 s pad (leading/trailing silence beyond that only costs NPU time).
+  std::vector<int16_t> AsrWindow() const {
+    const size_t pad = kRateOut / 5;
+    const size_t voiced_len = voiced_end_ - epoch_start_;
+    const size_t len = std::min(epoch_.size(), voiced_len + pad);
+    return std::vector<int16_t>(epoch_.begin(), epoch_.begin() + len);
+  }
+
+  void TickEpoch() {
+    next_tick_ = abs_ + tick_;
+    if (voiced_ < min_voiced_) return;
+    const std::vector<int16_t> window = AsrWindow();
+    last_window_len_ = window.size();
+    std::string hyp;
+    {
+      auto cell = arbiter_->Acquire();
+      hyp = asr_->TranscribePcm(window);
+    }
+    if (hyp.empty() || hyp.rfind("[ASR_ERROR]", 0) == 0) return;
+    // LocalAgreement-2 (punctuation-loose): confirm the content both this and
+    // the previous hypothesis agree on; the newer hypothesis's punctuation
+    // wins for display.  Length-preference revision: when consecutive
+    // hypotheses agree on a LONGER prefix that differs from the committed one
+    // (single-char jitter, e.g. the unstable speaker name), the longer
+    // agreement replaces it - the page renders whole-line so a revision is
+    // cheap, and the epoch close rewrites the line anyway.
+    std::string add;
+    if (!last_hyp_.empty()) {
+      const size_t p = CommonPrefixLoose(last_hyp_, hyp);
+      if (p > 0) {
+        const std::string nc = hyp.substr(0, p);
+        const std::string ncs = StripPunct(nc);
+        const std::string ocs = StripPunct(confirmed_);
+        if (ncs.size() >= ocs.size() && nc != confirmed_) {
+          add = ncs.compare(0, ocs.size(), ocs) == 0 && ncs.size() > ocs.size()
+                    ? ncs.substr(ocs.size())
+                    : "";
+          confirmed_ = nc;
+        }
+      }
+    }
+    last_hyp_ = hyp;
+    // Locate the confirmed content inside this hypothesis (punctuation may
+    // have moved) and show the rest as the provisional tail.
+    tail_ = hyp.substr(ContentMatchOffset(hyp, StripPunct(confirmed_)));
+    const bool changed = confirmed_ != emitted_text_ || tail_ != emitted_tail_;
+    if (!changed) return;
+    emitted_text_ = confirmed_;
+    emitted_tail_ = tail_;
+    const std::string b = EventLog::Sec(epoch_start_, kRateOut);
+    const std::string e = EventLog::Sec(abs_, kRateOut);
+    if (!streaming_text_file_.empty()) {
+      std::ofstream stxt(streaming_text_file_, std::ios::app);
+      stxt << "tick@[" << b << "," << e << "] " << confirmed_ << " | " << tail_
+           << "\n";
+    }
+    EventLog::Get().Write("stext",
+        "\"b\":" + b + ",\"e\":" + e +
+        ",\"add\":" + EventLog::Quote(add) +
+        ",\"text\":" + EventLog::Quote(confirmed_) +
+        ",\"tail\":" + EventLog::Quote(tail_));
+  }
+
+  // Epoch closes on a confirmed pause (word-safe), on the hard epoch cap, or
+  // at end of stream.  The final full-epoch hypothesis is committed in full;
+  // if it disagrees with the already-committed prefix the sfinal text simply
+  // replaces the epoch line on the page (append-only within ticks, but the
+  // epoch close is the authoritative-for-epoch view).
+  void FinalizeEpoch(bool end_of_stream) {
+    if (!in_epoch_) return;
+    in_epoch_ = false;
+    const bool voiced_enough = voiced_ >= min_voiced_ * 3 / 5;
+    if (voiced_enough) {
+      std::string text;
+      if (NeedFinalAsr()) {
+        const std::vector<int16_t> window = AsrWindow();
+        auto cell = arbiter_->Acquire();
+        text = asr_->TranscribePcm(window);
+      } else {
+        text = last_hyp_;  // nothing new since the last tick's hypothesis
+      }
+      if (text.empty() || text.rfind("[ASR_ERROR]", 0) == 0) text = last_hyp_;
+      if (!text.empty()) {
+        confirmed_ = text;
+        const std::string b = EventLog::Sec(epoch_start_, kRateOut);
+        const std::string e = EventLog::Sec(
+            end_of_stream ? abs_ : voiced_end_, kRateOut);
+        if (!streaming_text_file_.empty()) {
+          std::ofstream stxt(streaming_text_file_, std::ios::app);
+          stxt << "final@[" << b << "," << e << "] " << text << "\n";
+        }
+        EventLog::Get().Write("sfinal",
+            "\"b\":" + b + ",\"e\":" + e +
+            ",\"text\":" + EventLog::Quote(text));
+      }
+    }
+    epoch_.clear();
+    confirmed_.clear();
+    tail_.clear();
+    last_hyp_.clear();
+  }
+
+  // Skip the final ASR pass when the last tick's window already covered all
+  // voiced audio (pause close right after a tick): its hypothesis is the
+  // final text.  Compare against the last window length in samples.
+  bool NeedFinalAsr() const {
+    if (last_hyp_.empty()) return true;
+    const size_t voiced_len = voiced_end_ - epoch_start_;
+    return voiced_len > last_window_len_;
+  }
+
+  bool enabled_ = false;
+  SenseVoiceRunner* asr_ = nullptr;
+  Npu2CellArbiter* arbiter_ = nullptr;
+  std::string streaming_text_file_;
+  const size_t tick_, pause_close_, epoch_cap_;
+  const size_t min_voiced_ = kRateOut / 2;   // 0.5 s of voiced audio
+  BlockingQueue<Item> queue_{256};  // ~4 s of hops: ASR/diar NPU waits must
+                                    // not drop epoch audio (garbled text)
+  std::thread thread_;
+
+  // Slicer-thread state (fed through queue_).
+  size_t abs_ = 0;          // absolute 16k sample count fed so far
+  bool in_epoch_ = false;
+  std::vector<int16_t> epoch_;  // samples from epoch_start_ (includes pauses)
+  size_t epoch_start_ = 0, voiced_ = 0, silence_ = 0, voiced_end_ = 0;
+  size_t next_tick_ = 0;
+  size_t last_window_len_ = 0;
+  std::string confirmed_, tail_, last_hyp_;
+  std::string emitted_text_, emitted_tail_;
 };
 
 struct LlmJob {
@@ -2471,6 +2846,9 @@ class ResultWorker {
   }
   ~ResultWorker() { Close(); }
   void Submit(Segment s) { jobs_.Push(std::move(s)); }
+  // Streaming slicer shares the resident SenseVoice handle (its thread runs
+  // ASR between this worker's jobs; both acquire the NPU2 arbiter).
+  SenseVoiceRunner& Asr() { return asr_; }
   // Called once the pipeline's own AX Engine (BIG_LITTLE) is initialized.
   void StartDiarization() {
     if (!c_.diarization.enabled) return;
@@ -2810,16 +3188,16 @@ int StopChild(Child* child) { int status = 0; if (child->in >= 0) { close(child-
 
 class Pipeline {
  public:
-  Pipeline(apm_example::AppConfig c, std::string config_path) : config_(std::move(c)), config_path_(std::move(config_path)), arbiter_(), npu2_arbiter_(config_.llm.npu_lock_file), playback_mixer_(), results_(config_, &npu2_arbiter_, [this](std::vector<int16_t> samples) { playback_mixer_.AppendTts(std::move(samples)); }), enhancer_(config_, &arbiter_), vad_(config_, &arbiter_), accumulator_(config_, [this](Segment s) { results_.Submit(std::move(s)); }), vad_jobs_(std::max<size_t>(4, config_.vad.input_buffer_ms / std::max(1, config_.vad.hop_ms))), monitor_queue_(monitor_queue_capacity(config_)) { results_.StartDiarization(); vad_thread_ = std::thread([this] { VadLoop(); }); }
+  Pipeline(apm_example::AppConfig c, std::string config_path) : config_(std::move(c)), config_path_(std::move(config_path)), arbiter_(), npu2_arbiter_(config_.llm.npu_lock_file), playback_mixer_(), results_(config_, &npu2_arbiter_, [this](std::vector<int16_t> samples) { playback_mixer_.AppendTts(std::move(samples)); }), slicer_(config_, &results_.Asr(), &npu2_arbiter_), enhancer_(config_, &arbiter_), vad_(config_, &arbiter_), accumulator_(config_, [this](Segment s) { results_.Submit(std::move(s)); }), vad_jobs_(std::max<size_t>(4, config_.vad.input_buffer_ms / std::max(1, config_.vad.hop_ms))), monitor_queue_(monitor_queue_capacity(config_)) { results_.StartDiarization(); slicer_.Start(); vad_thread_ = std::thread([this] { VadLoop(); }); }
   void Run() { child_ = StartApm(config_, config_path_); std::thread monitor; if (config_.fastenhance.monitor_enabled || config_.hojo_tts.enabled) monitor = std::thread([this] { MonitorLoop(); }); std::vector<int16_t> raw(kRateIn / 100); while (!g_stop.load() && ReadAll(child_.out, raw.data(), raw.size() * sizeof(int16_t))) Process(raw); monitor_queue_.Close(); const int child_status = StopChild(&child_); if (monitor.joinable()) monitor.join(); const bool interrupted = g_stop.load(); Close(interrupted); if (!interrupted && (child_status == -1 || !WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0)) throw std::runtime_error("APM input process exited with an error"); }
-  void Close(bool abort = false) { if (closed_) return; closed_ = true; if (!abort) { if (!enhance_remainder_.empty()) { const size_t n = enhance_remainder_.size(); enhance_remainder_.resize(kEnhanceHop, 0); std::vector<int16_t> tail = enhance_remainder_; enhance_remainder_.clear(); Process(tail); (void)n; } if (!vad_remainder_.empty()) { vad_remainder_.resize(vad_.Hop(), 0); if (BatchInput()) vad_jobs_.Push(vad_remainder_); else vad_jobs_.TryPush(vad_remainder_); vad_remainder_.clear(); } } vad_jobs_.Close(); if (vad_thread_.joinable()) vad_thread_.join(); if (!abort) accumulator_.Flush(); results_.Close(abort); enhancer_.Report(); vad_.Report(); }
+  void Close(bool abort = false) { if (closed_) return; closed_ = true; if (!abort) { if (!enhance_remainder_.empty()) { const size_t n = enhance_remainder_.size(); enhance_remainder_.resize(kEnhanceHop, 0); std::vector<int16_t> tail = enhance_remainder_; enhance_remainder_.clear(); Process(tail); (void)n; } if (!vad_remainder_.empty()) { vad_remainder_.resize(vad_.Hop(), 0); if (BatchInput()) vad_jobs_.Push(vad_remainder_); else vad_jobs_.TryPush(vad_remainder_); vad_remainder_.clear(); } } vad_jobs_.Close(); if (vad_thread_.joinable()) vad_thread_.join(); if (!abort) accumulator_.Flush(); slicer_.FlushAndClose(); results_.Close(abort); enhancer_.Report(); vad_.Report(); }
  private:
   void Process(const std::vector<int16_t>& input) { EventLog::Get().MarkStart(); { auto diar_down = diar_decimator_.Process(input); diar_remainder_.insert(diar_remainder_.end(), diar_down.begin(), diar_down.end()); while (diar_remainder_.size() >= static_cast<size_t>(vad_.Hop())) { std::vector<int16_t> d(diar_remainder_.begin(), diar_remainder_.begin() + vad_.Hop()); diar_remainder_.erase(diar_remainder_.begin(), diar_remainder_.begin() + vad_.Hop()); results_.AppendSessionSamples(d); } } enhance_remainder_.insert(enhance_remainder_.end(), input.begin(), input.end()); while (enhance_remainder_.size() >= kEnhanceHop) { std::array<int16_t, kEnhanceHop> hop{}; std::copy_n(enhance_remainder_.begin(), kEnhanceHop, hop.begin()); enhance_remainder_.erase(enhance_remainder_.begin(), enhance_remainder_.begin() + kEnhanceHop); auto output = enhancer_.Process(hop); std::vector<int16_t> rendered(output.begin(), output.end()); if (!monitor_queue_.TryPush(rendered)) { monitor_queue_.TryDropOldest(); monitor_queue_.TryPush(std::move(rendered)); } std::vector<int16_t> enhanced(output.begin(), output.end()); auto down = decimator_.Process(enhanced); vad_remainder_.insert(vad_remainder_.end(), down.begin(), down.end()); while (vad_remainder_.size() >= static_cast<size_t>(vad_.Hop())) { std::vector<int16_t> v(vad_remainder_.begin(), vad_remainder_.begin() + vad_.Hop()); vad_remainder_.erase(vad_remainder_.begin(), vad_remainder_.begin() + vad_.Hop()); if (BatchInput()) vad_jobs_.Push(std::move(v)); else if (!vad_jobs_.TryPush(v)) { vad_jobs_.TryDropOldest(); vad_jobs_.TryPush(std::move(v)); } } } }
-  void VadLoop() { std::vector<int16_t> hop; while (vad_jobs_.Pop(&hop)) { bool voiced = true; try { voiced = vad_.Process(hop); } catch (const std::exception& e) { std::cerr << "[ten-vad] " << e.what() << "\n"; } accumulator_.Push(hop, voiced); } }
+  void VadLoop() { std::vector<int16_t> hop; while (vad_jobs_.Pop(&hop)) { bool voiced = true; try { voiced = vad_.Process(hop); } catch (const std::exception& e) { std::cerr << "[ten-vad] " << e.what() << "\n"; } accumulator_.Push(hop, voiced); slicer_.Push(hop, voiced); } }
   void MonitorLoop() { std::vector<int16_t> hop; while (!g_stop.load() && monitor_queue_.Pop(&hop)) { playback_mixer_.Mix(&hop, config_.fastenhance.monitor_enabled); if (!WriteAll(child_.in, hop.data(), hop.size() * sizeof(int16_t))) break; } }
   bool BatchInput() const { return config_.runtime.input == "file" && config_.runtime.file_input_mode == "batch"; }
   static size_t monitor_queue_capacity(const apm_example::AppConfig& c) { return std::max<size_t>(2, static_cast<size_t>(c.buffers.application_buffer_ms) * kRateIn / 1000 / kEnhanceHop); }
-  apm_example::AppConfig config_; std::string config_path_; NpuArbiter arbiter_; Npu2CellArbiter npu2_arbiter_; PlaybackMixer playback_mixer_; ResultWorker results_; FastEnhance enhancer_; TenVad vad_; Decimator decimator_; Decimator diar_decimator_; Accumulator accumulator_; BlockingQueue<std::vector<int16_t>> vad_jobs_; BlockingQueue<std::vector<int16_t>> monitor_queue_; std::thread vad_thread_; std::vector<int16_t> enhance_remainder_, vad_remainder_, diar_remainder_; Child child_; bool closed_ = false;
+  apm_example::AppConfig config_; std::string config_path_; NpuArbiter arbiter_; Npu2CellArbiter npu2_arbiter_; PlaybackMixer playback_mixer_; ResultWorker results_; StreamSlicer slicer_; FastEnhance enhancer_; TenVad vad_; Decimator decimator_; Decimator diar_decimator_; Accumulator accumulator_; BlockingQueue<std::vector<int16_t>> vad_jobs_; BlockingQueue<std::vector<int16_t>> monitor_queue_; std::thread vad_thread_; std::vector<int16_t> enhance_remainder_, vad_remainder_, diar_remainder_; Child child_; bool closed_ = false;
 };
 
 }  // namespace

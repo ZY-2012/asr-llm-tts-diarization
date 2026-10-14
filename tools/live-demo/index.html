@@ -7,13 +7,14 @@
 body{font-family:system-ui,sans-serif;margin:16px;background:#fafafa;color:#222}
 #bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 button,select{font-size:14px;padding:4px 10px}
-#stats{display:grid;grid-template-columns:repeat(6,auto);gap:4px 18px;margin:10px 0;font-size:13px}
+#stats{display:grid;grid-template-columns:repeat(7,auto);gap:4px 18px;margin:10px 0;font-size:13px}
 #stats b{font-weight:600}
 canvas{width:100%;height:260px;background:#fff;border:1px solid #ddd}
 #cols{display:flex;gap:12px;margin-top:10px}
 #final,#prev{flex:1;height:340px;overflow:auto;background:#fff;border:1px solid #ddd;padding:6px;font-size:14px}
 #prev{flex:0.6;color:#777}
 .ln{margin:2px 0}.tm{color:#888;font-size:12px}.lat{color:#c60;font-size:12px}
+.ssolid{color:#333}.stail{color:#b8b8b8}
 .sr-only{position:absolute;left:-9999px}
 </style>
 </head>
@@ -32,6 +33,8 @@ canvas{width:100%;height:260px;background:#fff;border:1px solid #ddd}
   <select id="psplit" title="段内攒够这么多秒有声后，遇到 0.3s 以上的自然停顿就成段；切点落在停顿上，比强制切分更保字"><option value="0">关</option><option value="4" selected>4s</option></select>
   <label for="preview">快字间隔</label>
   <select id="preview" title="无说话人的快速文字：每攒这么多秒有声就出一条 [起,止]: 文字，比说话人+文字快得多，但无说话人且切片处偶有糊字；说话人+文字出来后以其为准"><option value="0">关</option><option value="3">3s</option><option value="2" selected>2s</option><option value="1">1s</option></select>
+  <label for="tick">流式文字</label>
+  <select id="tick" title="固定节拍流式文本：以停顿划分「句段」（词安全切点），段内每过这么多秒就把整段重新转写一次，用连续两次一致的最长前缀当已确认文字（黑色），其余先灰色显示等下一拍确认；独白不停也能持续出字，替代「快字间隔」的暂停门控"><option value="0">关（用旧快字）</option><option value="0.8" selected>0.8s</option><option value="0.5">0.5s</option><option value="1.2">1.2s</option></select>
   <label><input type="checkbox" id="typer" checked> 模拟流式</label>
   <button id="startBtn">开始</button>
   <button id="stopBtn">停止</button>
@@ -45,6 +48,7 @@ canvas{width:100%;height:260px;background:#fff;border:1px solid #ddd}
   <span>首个预览文字 <b id="sPrev">-</b></span>
   <span>首个说话人+文字 <b id="sFirst">-</b></span>
   <span>说话人+文字平均延迟 <b id="sAvg">-</b></span>
+  <span>首个流式文字 <b id="sStext">-</b></span>
 </div>
 <canvas id="cv" width="1400" height="260" aria-label="时间轴：参考标注、说话人输出、文字、波形；红线为当前时刻"></canvas>
 <div id="cols">
@@ -60,7 +64,7 @@ const REFPAL = ['#9ecae1','#fdae6b','#a1d99b','#fc9272'];
 let S = null, es = null, raf = 0;
 function reset(){
   S = {t0:null, frozen:null, diar:[], cov:0, prev:[], fin:[], ref:[], peaks:null, pps:50,
-       spk:{}, rspk:{}, firstPrev:null, firstFin:null, lats:[], running:false};
+       spk:{}, rspk:{}, firstPrev:null, firstFin:null, firstStext:null, st:null, lats:[], running:false};
   ['final','prev'].forEach(id => { const el = $(id); if (el._typing) { clearTimeout(el._typing.timer); el._typing = null; } el._lastArrive = null; el._estGap = null; });
   $('final').innerHTML = ''; $('prev').innerHTML = '';
 }
@@ -120,6 +124,43 @@ function addTypedLine(el, prefix, text, cls, suffix){
   tick();
 }
 function esc(s){ return s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'})[c]); }
+// Streaming text (stext/sfinal): one growing line per speech epoch.  Solid
+// text is confirmed (LocalAgreement-2 across consecutive ticks); the gray
+// tail is the provisional remainder until the next tick or epoch close.
+function streamLine(el, b){
+  completeTyping(el);
+  const div = document.createElement('div'); div.className = 'ln';
+  const stamp = document.createElement('span'); stamp.className = 'tm';
+  stamp.textContent = '[' + clock(b) + '] ';
+  const solid = document.createElement('span'); solid.className = 'ssolid';
+  const tail = document.createElement('span'); tail.className = 'stail';
+  div.appendChild(stamp); div.appendChild(solid); div.appendChild(tail);
+  el.appendChild(div);
+  return { key: b, div, solid, tail };
+}
+function settleStream(){
+  if (!S.st) return;
+  S.st.tail.textContent = '';
+  S.st = null;
+}
+function onStext(ev){
+  const el = $('prev');
+  if (!S.st || S.st.key !== ev.b) { settleStream(); S.st = streamLine(el, ev.b); }
+  if (S.firstStext === null) S.firstStext = ev.t;
+  S.st.solid.textContent = ev.text;
+  S.st.tail.textContent = ev.tail;
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 26) el.scrollTop = el.scrollHeight;
+}
+function onSfinal(ev){
+  const el = $('prev');
+  if (!S.st || S.st.key !== ev.b) { settleStream(); S.st = streamLine(el, ev.b); }
+  if (S.firstStext === null) S.firstStext = ev.t;
+  S.st.solid.textContent = ev.text;
+  S.st.tail.textContent = '';
+  settleStream();
+  S.prev.push({ b: ev.b, e: ev.e });   // epoch bar on the timeline text row
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 26) el.scrollTop = el.scrollHeight;
+}
 function onEvent(ev){
   if (ev.ev === 'status') { S.running = ev.running;
     $('startBtn').disabled = ev.running;
@@ -133,6 +174,8 @@ function onEvent(ev){
   if (ev.ev === 'diar') { S.diar.push(...ev.parts.map(p => ({b:p[0], e:p[1], spk:p[2], t:ev.t}))); S.cov = Math.max(S.cov, ev.core[1]); }
   else if (ev.ev === 'preview') { S.prev.push(ev); if (S.firstPrev === null) S.firstPrev = ev.t;
     addTypedLine($('prev'), `[${clock(ev.b)}, ${clock(ev.e)}] (${clock(ev.t)} 出) `, ev.text); }
+  else if (ev.ev === 'stext') { onStext(ev); }
+  else if (ev.ev === 'sfinal') { onSfinal(ev); }
   else if (ev.ev === 'final') { S.fin.push(ev); if (S.firstFin === null) S.firstFin = ev.t; S.lats.push(ev.t - ev.e);
     const c = ev.spk ? color(S.spk, PAL, ev.spk) : '#666';
     addTypedLine($('final'), `<b style="color:${c}">${esc(ev.spk || '?')}</b> <span>[${clock(ev.b)}–${clock(ev.e)}]</span> `, ev.text, '',
@@ -166,6 +209,7 @@ function draw(){
   $('sCov').textContent = S.t0 === null ? '-' : clock(S.cov);
   $('sLag').textContent = S.t0 === null ? '-' : fmt(Math.max(0, n - S.cov));
   $('sPrev').textContent = fmt(S.firstPrev); $('sFirst').textContent = fmt(S.firstFin);
+  $('sStext').textContent = fmt(S.firstStext);
   $('sAvg').textContent = S.lats.length ? fmt(S.lats.reduce((a, b) => a + b, 0) / S.lats.length) : '-';
 }
 function connect(){
@@ -180,7 +224,7 @@ $('startBtn').onclick = async () => {
   au.muted = true; au.play().then(() => au.pause()).catch(() => {});
   S.ref = await (await fetch('/ref?limit=' + (input === '60' ? 60 : 1e9))).json();
   loadWave(input);
-  const r = await fetch('/start?input=' + input + '&step=' + $('step').value + '&maxseg=' + $('maxseg').value + '&psplit=' + $('psplit').value + '&preview=' + $('preview').value + '&trail=' + $('trail').value, {method: 'POST'});
+  const r = await fetch('/start?input=' + input + '&step=' + $('step').value + '&maxseg=' + $('maxseg').value + '&psplit=' + $('psplit').value + '&preview=' + $('preview').value + '&trail=' + $('trail').value + '&tick=' + $('tick').value, {method: 'POST'});
   const j = await r.json(); $('status').textContent = j.msg;
   if (j.ok) connect();
 };
@@ -195,6 +239,13 @@ $('stopBtn').onclick = () => {
     .catch(() => { $('status').textContent = '停止请求失败'; });
 };
 $('mute').onchange = () => { au.muted = $('mute').checked; };
+// Streaming text replaces the pause-gated preview path: forcing preview off
+// avoids duplicated fast text (the server enforces the same rule).
+$('tick').onchange = () => {
+  const on = $('tick').value !== '0';
+  $('preview').disabled = on;
+  if (on) $('preview').value = '0';
+};
 reset(); draw();
 fetch('/status').then(r => r.json()).then(s => { if (s.running) { $('status').textContent = '有任务在运行，已接入'; connect(); } });
 </script>
