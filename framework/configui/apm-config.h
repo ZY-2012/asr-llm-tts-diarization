@@ -150,6 +150,24 @@ struct AppConfig {
     float online_update_min_sec = 1.0f;
     // "online" mode only: hard cap on global speakers in the table.
     int online_max_speakers = 20;
+    // diart-style incremental clustering (streaming session/online mode).
+    // Instead of buffering a full `session_chunk_sec` window and running
+    // batch AHC+PLDA+VBx, each 10 s sub-window is submitted to the resident
+    // worker one at a time and merged into a running global speaker set, so
+    // the first label emits from sub-window 0 (~10 s) instead of ~132 s.
+    // Use with session_chunk_sec == session_step_sec == 10 (the engine's
+    // fixed 10 s analysis window).
+    bool incremental = false;
+    // Match on the PLDA discriminant projection (256 -> 128) instead of raw
+    // 256-D cosine.  Recommended for 3+ speakers (delta_new 0.55 works across
+    // scenes); raw cosine is better for the 2-speaker case.
+    bool incremental_plda = false;
+    // New-speaker cosine-distance gate: a local speaker becomes a new global
+    // speaker only when its nearest running centroid is farther than this.
+    float incremental_delta_new = 0.5f;
+    // Centroid-update / new-speaker gate: a local speaker must be active for
+    // at least this fraction of a sub-window to create or update a centroid.
+    float incremental_rho_update = 0.4f;
   } diarization;
 
   struct Asr {

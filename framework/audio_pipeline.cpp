@@ -1819,6 +1819,16 @@ void AddAssignArgs(std::vector<std::string>* args,
     args->push_back("--max-speakers");
     args->push_back(std::to_string(config.online_max_speakers));
   }
+  if (config.incremental) {
+    // diart-style incremental clustering (engine-side), replacing the batch
+    // AHC+PLDA+VBx path.  Independent of the speaker-table assignment mode.
+    args->push_back("--incremental");
+    if (config.incremental_plda) args->push_back("--incremental-plda");
+    args->push_back("--delta-new");
+    args->push_back(std::to_string(config.incremental_delta_new));
+    args->push_back("--rho-update");
+    args->push_back(std::to_string(config.incremental_rho_update));
+  }
 }
 
 // Reads the sample rate from a RIFF/WAVE file; returns 0 when the file is not
@@ -2274,7 +2284,14 @@ class ResultWorker {
                         ? c_.diarization.session_first_window_sec
                         : c_.diarization.session_chunk_sec)
                 << "s max_wait=" << c_.diarization.session_max_wait_sec
-                << "s\n";
+                << "s";
+      if (c_.diarization.incremental)
+        std::cerr << " incremental(delta_new="
+                  << c_.diarization.incremental_delta_new
+                  << ",rho_update=" << c_.diarization.incremental_rho_update
+                  << (c_.diarization.incremental_plda ? ",plda" : ",raw")
+                  << ")";
+      std::cerr << "\n";
     }
   }
 

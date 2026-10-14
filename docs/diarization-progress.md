@@ -226,9 +226,18 @@ delta_new/rho_update/tau_active/max_speakers），`Run()` 加 `incremental` 参�
 注：流式响应为 `parts`（每子窗独立 partition、覆盖含静音），其 conf 3.42% 系
 partition 边界断裂的口径假象；聚类质量本身与 oneshot 等价（rttm 口径 conf 0.39%）。
 
-**下一步（可选）**：audio_pipeline 集成逐 10s 子窗提交（替换 120s 整窗缓冲）即可
-把冷启动首标签从 132.3s 降到 ~10s；多说话人场景可开 `--incremental-plda`（delta_new
-0.55 三场景统一），或探索自适应 delta_new。
+**audio_pipeline 全链路集成（2026-10-14 完成）**：`Diarization` 配置新增
+`incremental` / `incremental_plda` / `incremental_delta_new` / `incremental_rho_update`
+四字段（`apm-config.h/.cpp`，校验 delta_new∈(0,2]、rho_update∈(0,1)），
+`AddAssignArgs()` 透传 `--incremental[--incremental-plda] --delta-new --rho-update`；
+`session_chunk_sec` 校验下限从 20s 放宽到 10s（增量聚类语境下「窗」= 10s 分析子窗，
+聚类上下文是跨请求的 `inc_fc_/inc_rc_` 状态，非重聚窗）。落地配置即
+`session_chunk_sec == session_step_sec == 10`（`config-2pw-inc.yaml`），现有
+`SessionDiarizer` 的滑窗提交在 chunk==step 时自然退化为逐 10s 非重叠子窗，无需改框架循环。
+板端 2P 全程实测：**首标签 wall=+10.22s**（10s 缓冲 + 0.24s 推理，vs 132.3s 提前 ~13 倍），
+第 1 子窗即发现 2 人（speaker-1/speaker-2），稳态每 10s 窗推理 221~242ms
+（rtf≈0.023，标签延迟 ~0.2s）。多说话人场景可开 `--incremental-plda`（delta_new 0.55
+三场景统一），或探索自适应 delta_new。
 
 ## 3. 已完成的工作
 

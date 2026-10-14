@@ -247,7 +247,7 @@ bool ValidateAppConfig(const AppConfig& c, std::string* error) {
       c.diarization.omp_threads < 1 || c.diarization.omp_threads > 64 ||
       (c.diarization.mode != "segment" && c.diarization.mode != "session" &&
        c.diarization.mode != "online") ||
-      c.diarization.session_chunk_sec < 20.0f ||
+      c.diarization.session_chunk_sec < 10.0f ||
       c.diarization.session_chunk_sec > 600.0f ||
       c.diarization.session_step_sec < 0.0f ||
       c.diarization.session_step_sec > c.diarization.session_chunk_sec ||
@@ -261,6 +261,10 @@ bool ValidateAppConfig(const AppConfig& c, std::string* error) {
       c.diarization.online_update_min_sec > 30.0f ||
       c.diarization.online_max_speakers < 2 ||
       c.diarization.online_max_speakers > 40 ||
+      c.diarization.incremental_delta_new <= 0.0f ||
+      c.diarization.incremental_delta_new > 2.0f ||
+      c.diarization.incremental_rho_update <= 0.0f ||
+      c.diarization.incremental_rho_update >= 1.0f ||
       c.diarization.runner.empty() || c.diarization.model_path.empty() ||
       c.diarization.speaker_table_path.empty()) {
     *error = "Diarization worker/model values are invalid";
@@ -435,6 +439,8 @@ bool LoadAppConfig(const std::string& path,
       "diarization.online_min_new_speech_sec",
       "diarization.online_update_min_sec",
       "diarization.online_max_speakers",
+      "diarization.incremental", "diarization.incremental_plda",
+      "diarization.incremental_delta_new", "diarization.incremental_rho_update",
       "asr.enabled", "asr.model_path", "asr.model_type", "asr.language",
       "asr.library", "asr.npu_core", "asr.worker_threads",
       "llm.enabled", "llm.model_path", "llm.runner", "llm.system_prompt",
@@ -541,6 +547,10 @@ bool LoadAppConfig(const std::string& path,
   GET_NUM("diarization.online_min_new_speech_sec", c->diarization.online_min_new_speech_sec);
   GET_NUM("diarization.online_update_min_sec", c->diarization.online_update_min_sec);
   GET_NUM("diarization.online_max_speakers", c->diarization.online_max_speakers);
+  GET_BOOL("diarization.incremental", c->diarization.incremental);
+  GET_BOOL("diarization.incremental_plda", c->diarization.incremental_plda);
+  GET_NUM("diarization.incremental_delta_new", c->diarization.incremental_delta_new);
+  GET_NUM("diarization.incremental_rho_update", c->diarization.incremental_rho_update);
   GET_BOOL("asr.enabled", c->asr.enabled);
   GET_STRING("asr.model_path", c->asr.model_path);
   GET_STRING("asr.model_type", c->asr.model_type);
