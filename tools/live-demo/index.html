@@ -48,12 +48,13 @@ const PAL = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b'];
 const REFPAL = ['#9ecae1','#fdae6b','#a1d99b','#fc9272'];
 let S = null, es = null, raf = 0;
 function reset(){
-  S = {t0:null, diar:[], cov:0, prev:[], fin:[], ref:[], peaks:null, pps:50,
+  S = {t0:null, frozen:null, diar:[], cov:0, prev:[], fin:[], ref:[], peaks:null, pps:50,
        spk:{}, rspk:{}, firstPrev:null, firstFin:null, lats:[], running:false};
   $('final').innerHTML = ''; $('prev').innerHTML = '';
 }
 function color(map, pal, id){ if(!(id in map)) map[id] = pal[Object.keys(map).length % pal.length]; return map[id]; }
-function now(){ return S && S.t0 !== null ? (performance.now() - S.t0) / 1000 : 0; }
+function now(){ if (!S || S.t0 === null) return 0;
+  return S.frozen !== null ? S.frozen : (performance.now() - S.t0) / 1000; }
 function fmt(x){ return x === null || x === undefined ? '-' : x.toFixed(1) + 's'; }
 function clock(x){ const m = Math.floor(x / 60), s = x - m * 60; return m + ':' + s.toFixed(1).padStart(4, '0'); }
 async function loadWave(input){
@@ -73,19 +74,21 @@ function addLine(el, html){ const div = document.createElement('div'); div.class
 function esc(s){ return s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'})[c]); }
 function onEvent(ev){
   if (ev.ev === 'status') { S.running = ev.running;
+    $('startBtn').disabled = ev.running;
     $('status').textContent = ev.running ? (S.t0 === null ? '加载模型中… ' + ev.since + 's' : '运行中') : (S.t0 === null ? '空闲' : '已结束');
+    if (!ev.running && S.t0 !== null && S.frozen === null) { au.pause(); S.frozen = now(); }
     return; }
   if (ev.ev === 'start') { S.t0 = performance.now(); au.currentTime = 0; au.muted = $('mute').checked; au.play().catch(()=>{}); return; }
   if (S.t0 === null) return;
   // SSE is polled every 0.1 s: never let the page clock lag the board clock.
-  if (ev.t > now()) S.t0 = performance.now() - ev.t * 1000;
+  if (S.frozen === null && ev.t > now()) S.t0 = performance.now() - ev.t * 1000;
   if (ev.ev === 'diar') { S.diar.push(...ev.parts.map(p => ({b:p[0], e:p[1], spk:p[2], t:ev.t}))); S.cov = Math.max(S.cov, ev.core[1]); }
   else if (ev.ev === 'preview') { S.prev.push(ev); if (S.firstPrev === null) S.firstPrev = ev.t;
     addLine($('prev'), `<span class="tm">${clock(ev.b)} 出于 ${clock(ev.t)}</span> ${esc(ev.text)}`); }
   else if (ev.ev === 'final') { S.fin.push(ev); if (S.firstFin === null) S.firstFin = ev.t; S.lats.push(ev.t - ev.e);
     const c = ev.spk ? color(S.spk, PAL, ev.spk) : '#666';
     addLine($('final'), `<b style="color:${c}">${esc(ev.spk || '?')}</b> <span class="tm">[${clock(ev.b)}–${clock(ev.e)}]</span> ${esc(ev.text)} <span class="lat">+${(ev.t - ev.e).toFixed(1)}s</span>`); }
-  else if (ev.ev === 'end') { au.pause(); }
+  else if (ev.ev === 'end') { au.pause(); if (S.frozen === null) S.frozen = ev.t; }
 }
 const SPAN = 30;  // seconds visible; "now" sits at 85% of the width
 function draw(){
@@ -132,7 +135,16 @@ $('startBtn').onclick = async () => {
   const j = await r.json(); $('status').textContent = j.msg;
   if (j.ok) connect();
 };
-$('stopBtn').onclick = async () => { await fetch('/stop', {method: 'POST'}); au.pause(); };
+$('stopBtn').onclick = () => {
+  // Pause the browser-side "microphone" immediately; the board pipeline needs
+  // a few seconds to flush its final window, so /stop is fire-and-forget.
+  au.pause();
+  if (S.t0 !== null && S.frozen === null) S.frozen = now();
+  $('status').textContent = '停止中…';
+  fetch('/stop', {method: 'POST'}).then(r => r.json())
+    .then(j => { $('status').textContent = j.msg; })
+    .catch(() => { $('status').textContent = '停止请求失败'; });
+};
 $('mute').onchange = () => { au.muted = $('mute').checked; };
 reset(); draw();
 fetch('/status').then(r => r.json()).then(s => { if (s.running) { $('status').textContent = '有任务在运行，已接入'; connect(); } });
