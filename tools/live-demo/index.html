@@ -10,9 +10,7 @@ button,select{font-size:14px;padding:4px 10px}
 #stats{display:grid;grid-template-columns:repeat(7,auto);gap:4px 18px;margin:10px 0;font-size:13px}
 #stats b{font-weight:600}
 canvas{width:100%;height:260px;background:#fff;border:1px solid #ddd}
-#cols{display:flex;gap:12px;margin-top:10px}
-#final,#prev{flex:1;height:340px;overflow:auto;background:#fff;border:1px solid #ddd;padding:6px;font-size:14px}
-#prev{flex:0.6;color:#777}
+#feed{height:420px;overflow:auto;background:#fff;border:1px solid #ddd;padding:6px;font-size:14px;margin-top:10px}
 .ln{margin:2px 0}.tm{color:#888;font-size:12px}.lat{color:#c60;font-size:12px}
 .ssolid{color:#333}.stail{color:#b8b8b8}
 .sr-only{position:absolute;left:-9999px}
@@ -51,10 +49,7 @@ canvas{width:100%;height:260px;background:#fff;border:1px solid #ddd}
   <span>首个流式文字 <b id="sStext">-</b></span>
 </div>
 <canvas id="cv" width="1400" height="260" aria-label="时间轴：参考标注、说话人输出、文字、波形；红线为当前时刻"></canvas>
-<div id="cols">
-  <div id="final" aria-label="正式结果（说话人+文字）" aria-live="off"></div>
-  <div id="prev" aria-label="预览文字（无说话人）"></div>
-</div>
+<div id="feed" aria-label="实时转写：流式先行，权威稿到达后原地对账（说话人+时间+文字）"></div>
 <audio id="au" preload="auto"></audio>
 <script>
 const $ = id => document.getElementById(id);
@@ -64,9 +59,11 @@ const REFPAL = ['#9ecae1','#fdae6b','#a1d99b','#fc9272'];
 let S = null, es = null, raf = 0;
 function reset(){
   S = {t0:null, frozen:null, diar:[], cov:0, prev:[], fin:[], ref:[], peaks:null, pps:50,
-       spk:{}, rspk:{}, firstPrev:null, firstFin:null, firstStext:null, st:null, lats:[], running:false};
-  ['final','prev'].forEach(id => { const el = $(id); if (el._typing) { clearTimeout(el._typing.timer); el._typing = null; } el._lastArrive = null; el._estGap = null; });
-  $('final').innerHTML = ''; $('prev').innerHTML = '';
+       spk:{}, rspk:{}, firstPrev:null, firstFin:null, firstStext:null, st:null, rows:[], lats:[], running:false};
+  const el = $('feed');
+  if (el._typing) { clearTimeout(el._typing.timer); el._typing = null; }
+  el._lastArrive = null; el._estGap = null;
+  el.innerHTML = '';
 }
 function color(map, pal, id){ if(!(id in map)) map[id] = pal[Object.keys(map).length % pal.length]; return map[id]; }
 function now(){ if (!S || S.t0 === null) return 0;
@@ -85,8 +82,6 @@ async function loadWave(input){
     S.peaks = p; ac.close();
   } catch (e) { console.warn('waveform', e); }
 }
-function addLine(el, html){ const div = document.createElement('div'); div.className = 'ln'; div.innerHTML = html;
-  const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 20; el.appendChild(div); if (stick) el.scrollTop = el.scrollHeight; }
 // Typewriter line: reveal the body text char-by-char over ~1s while the
 // prefix (speaker stamp / time range) shows immediately.  Purely cosmetic
 // streaming - the underlying events are unchanged.
@@ -110,7 +105,7 @@ function addTypedLine(el, prefix, text, cls, suffix){
   const at = performance.now();
   const prevArrive = el._lastArrive; el._lastArrive = at;
   if (prevArrive && at - prevArrive > 120) el._estGap = at - prevArrive;  // ignore bursts
-  if (!$('typer').checked || !text) { body.textContent = text; stick(); return; }
+  if (!$('typer').checked || !text) { body.textContent = text; stick(); return div; }
   const ch = Array.from(text);
   const est = Math.min(6000, Math.max(600, el._estGap || 1500));
   const dur = Math.min(4500, Math.max(400, est * 0.9));  // aim to finish just before the next line
@@ -122,12 +117,34 @@ function addTypedLine(el, prefix, text, cls, suffix){
     if (i < ch.length) el._typing.timer = setTimeout(tick, per);
     else el._typing = null; };
   tick();
+  return div;
 }
 function esc(s){ return s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'})[c]); }
-// Streaming text (stext/sfinal): one growing line per speech epoch.  Solid
-// text is confirmed (LocalAgreement-2 across consecutive ticks); the gray
-// tail is the provisional remainder until the next tick or epoch close.
-function streamLine(el, b){
+// ---- Single feed: streaming first, authoritative on arrival ----
+// A row = one speech epoch (streaming) or one final segment (inserted when no
+// epoch covers it).  Streaming rows reconcile IN PLACE when finals arrive:
+// the row's intersecting finals are spliced in as colored text segments and
+// the stamp shows every speaker of those finals, so a cross-speaker epoch
+// (0.2 s pause does not always split a speaker turn) displays both labels.
+function stampHTML(spks, b, e){
+  let h = '';
+  for (const s of spks) h += '<b style="color:' + color(S.spk, PAL, s) + '">' + esc(s) + '</b> ';
+  return h + '<span>[' + clock(b) + (e === null ? '' : '–' + clock(e)) + ']</span> ';
+}
+function speakersOf(b, e){
+  const agg = new Map();
+  for (const d of S.diar) {
+    const o = Math.min(e, d.e) - Math.max(b, d.b);
+    if (o > 0.05) agg.set(d.spk, (agg.get(d.spk) || 0) + o);
+  }
+  return [...agg.entries()].sort((a, c) => c[1] - a[1]).slice(0, 2).map(x => x[0]);
+}
+function feedStick(){
+  const el = $('feed');
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 26) el.scrollTop = el.scrollHeight;
+}
+function streamLine(b){
+  const el = $('feed');
   completeTyping(el);
   const div = document.createElement('div'); div.className = 'ln';
   const stamp = document.createElement('span'); stamp.className = 'tm';
@@ -136,62 +153,121 @@ function streamLine(el, b){
   const tail = document.createElement('span'); tail.className = 'stail';
   div.appendChild(stamp); div.appendChild(solid); div.appendChild(tail);
   el.appendChild(div);
-  const ln = { key: b, b: b, e: null, div, stamp, solid, tail, spk: null };
-  div._ln = ln;
+  const ln = { key: b, b: b, e: null, div, stamp, solid, tail, spk: null, auth: false };
+  div._ln = ln; S.rows.push(ln);
   return ln;
 }
 function settleStream(){
   if (!S.st) return;
-  S.st.tail.textContent = '';
-  if (S.st.e === null) S.st.e = now();
+  const row = S.st;
+  row.tail.textContent = '';
+  if (row.e === null) row.e = now();
   S.st = null;
+  renderAuthRow(row);   // authoritative finals may already be assigned to it
 }
-// Late speaker back-fill: diar coverage may pass an epoch after it finalized
-// (the label commit lags the text). Walk settled lines once per diar event.
-function backfillSpeakers(){
-  const el = $('prev');
-  for (const div of el.children) {
-    const ln = div._ln;
-    if (!ln || ln.spk || ln.e === undefined || ln.e <= ln.b) continue;
-    let best = null, bestLen = 0;
-    for (const d of S.diar) {
-      const o = Math.min(ln.e, d.e) - Math.max(ln.b, d.b);
-      if (o > bestLen) { bestLen = o; best = d.spk; }
+// Live (non-authoritative) row stamp: speakers from the diar timeline,
+// longest-overlap first, at most two, in the [start–end] time format.  For a
+// still-growing epoch e is the latest tick's end, so the range widens live.
+function paintLiveStamp(ln){
+  if (ln.auth || !ln.stamp || ln.e === null || ln.e <= ln.b) return;
+  const spks = speakersOf(ln.b, ln.e);
+  ln.spk = spks;
+  ln.stamp.innerHTML = stampHTML(spks, ln.b, ln.e);
+}
+// Authoritative view of a row: every final assigned to it splices in one
+// colored text segment; the stamp shows all of their speakers and the row's
+// full span.  Deterministic and echo-free: each final belongs to one row.
+// Active rows (S.st) are skipped - they keep streaming until epoch close.
+function renderAuthRow(r){
+  if (r === S.st) return;
+  const fs = S.fin.filter(x => x._row === r).sort((a, b) => a.b - b.b);
+  if (!fs.length) return;
+  const spks = [...new Set(fs.map(x => x.spk))];
+  r.stamp.innerHTML = stampHTML(spks, r.b, Math.max(r.e ?? r.b, fs[fs.length - 1].e));
+  r.solid.innerHTML = fs.map(x =>
+    '<span style="color:' + (x.spk ? color(S.spk, PAL, x.spk) : '#666') + '">' +
+    esc(x.text) + '</span>').join(' ');
+  if (r.tail) r.tail.textContent = '';
+  let lat = r.div.querySelector('.lat');
+  if (!lat) { lat = document.createElement('span'); lat.className = 'lat'; r.div.appendChild(lat); }
+  lat.textContent = ' +' + (fs[fs.length - 1].t - fs[0].e).toFixed(1) + 's';
+  r.auth = true;
+  feedStick();
+}
+// Reconcile on every final event: legacy preview lines (tick=0) are absorbed
+// by their covering final; the final is assigned to the row with the largest
+// overlap (active epochs count up to now()); settled rows re-render, active
+// ones re-render at their epoch close.  A final with no row inserts its own
+// authoritative line in time order.
+function reconcile(f){
+  const ov = (a, b, c, d) => Math.max(0, Math.min(b, d) - Math.max(a, c));
+  for (let i = S.rows.length - 1; i >= 0; i--) {
+    const r = S.rows[i];
+    if (r.pv && ov(r.b, r.e, f.b, f.e) / Math.max(0.01, r.e - r.b) >= 0.6) {
+      r.div.remove(); S.rows.splice(i, 1);
     }
-    if (best) { ln.spk = best; const c = color(S.spk, PAL, best);
-      div._ln.stamp.innerHTML = '<b style="color:' + c + '">' + esc(best) + '</b> [' + clock(ln.b) + '] '; }
   }
+  let best = null, bo = 0.05;
+  for (const r of S.rows) {
+    if (r.pv) continue;                 // preview lines are absorbed, never assigned
+    const o = ov(r.b, r.e ?? now(), f.b, f.e);
+    if (o > bo) { bo = o; best = r; }
+  }
+  if (best) { f._row = best; if (best.e !== null && best !== S.st) renderAuthRow(best); }
+  else insertFinalRow(f);
+  // drop superseded rows: settled epoch rows this final touched that never won
+  // any final and are now >=95% covered by the (disjoint) finals shown
+  // elsewhere - keeping them would duplicate their text in gray
+  for (let i = S.rows.length - 1; i >= 0; i--) {
+    const r = S.rows[i];
+    if (r.pv || r.auth || r === S.st || r.e === null) continue;
+    if (ov(r.b, r.e, f.b, f.e) <= 0.05) continue;
+    const iv = [];
+    for (const x of S.fin) { const a = Math.max(r.b, x.b), z = Math.min(r.e, x.e);
+      if (z - a > 0.05) iv.push([a, z]); }
+    iv.sort((a, b) => a[0] - b[0]);
+    let cov = 0, ce = -1;
+    for (const [a, z] of iv) { if (a > ce) { cov += z - a; ce = z; }
+      else if (z > ce) { cov += z - ce; ce = z; } }
+    if (cov / Math.max(0.01, r.e - r.b) >= 0.95) { r.div.remove(); S.rows.splice(i, 1); }
+  }
+}
+function insertFinalRow(f){
+  const el = $('feed');
+  completeTyping(el);
+  const div = document.createElement('div'); div.className = 'ln';
+  const stamp = document.createElement('span'); stamp.className = 'tm';
+  const solid = document.createElement('span'); solid.className = 'ssolid';
+  const lat = document.createElement('span'); lat.className = 'lat';
+  div.appendChild(stamp); div.appendChild(solid); div.appendChild(lat);
+  const ln = { key: f.b, b: f.b, e: f.e, div, stamp, solid, tail: null, spk: null, auth: false };
+  div._ln = ln; S.rows.push(ln);
+  let ref = null;
+  for (const child of el.children) { const r = child._ln; if (r && r.b > f.b) { ref = child; break; } }
+  el.insertBefore(div, ref);
+  f._row = ln;
+  renderAuthRow(ln);
+  feedStick();
 }
 function onStext(ev){
-  const el = $('prev');
-  if (!S.st || S.st.key !== ev.b) { settleStream(); S.st = streamLine(el, ev.b); }
+  if (!S.st || S.st.key !== ev.b) { settleStream(); S.st = streamLine(ev.b); }
   if (S.firstStext === null) S.firstStext = ev.t;
+  S.st.e = ev.e;               // latest tick end: the [b–e] range widens live
   S.st.solid.textContent = ev.text;
   S.st.tail.textContent = ev.tail;
-  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 26) el.scrollTop = el.scrollHeight;
+  paintLiveStamp(S.st);
+  feedStick();
 }
 function onSfinal(ev){
-  const el = $('prev');
-  if (!S.st || S.st.key !== ev.b) { settleStream(); S.st = streamLine(el, ev.b); }
+  if (!S.st || S.st.key !== ev.b) { settleStream(); S.st = streamLine(ev.b); }
   if (S.firstStext === null) S.firstStext = ev.t;
-  // Speaker post-labeling: overlap the epoch with the diar timeline; the
-  // speaker owning most of the interval wins (labels arrive later than the
-  // text by design - P3 back-fill).
-  let best = null, bestLen = 0;
-  for (const d of S.diar) {
-    const o = Math.min(ev.e, d.e) - Math.max(ev.b, d.b);
-    if (o > bestLen) { bestLen = o; best = d.spk; }
-  }
-  if (best) { const c = color(S.spk, PAL, best);
-    S.st.stamp.innerHTML = '<b style="color:' + c + '">' + esc(best) + '</b> [' + clock(ev.b) + '] '; }
   S.st.e = ev.e;
-  S.st.spk = best;
   S.st.solid.textContent = ev.text;
   S.st.tail.textContent = '';
   settleStream();
-  backfillSpeakers();
+  for (const r of S.rows.slice(-8)) paintLiveStamp(r);  // recent live rows only
   S.prev.push({ b: ev.b, e: ev.e });   // epoch bar on the timeline text row
-  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 26) el.scrollTop = el.scrollHeight;
+  feedStick();
 }
 function onEvent(ev){
   if (ev.ev === 'status') { S.running = ev.running;
@@ -203,16 +279,19 @@ function onEvent(ev){
   if (S.t0 === null) return;
   // SSE is polled every 0.1 s: never let the page clock lag the board clock.
   if (S.frozen === null && ev.t > now()) S.t0 = performance.now() - ev.t * 1000;
-  if (ev.ev === 'diar') { S.diar.push(...ev.parts.map(p => ({b:p[0], e:p[1], spk:p[2], t:ev.t}))); S.cov = Math.max(S.cov, ev.core[1]); backfillSpeakers(); }
+  if (ev.ev === 'diar') { S.diar.push(...ev.parts.map(p => ({b:p[0], e:p[1], spk:p[2], t:ev.t}))); S.cov = Math.max(S.cov, ev.core[1]);
+    for (const r of S.rows.slice(-8)) paintLiveStamp(r); }  // coverage frontier may pass recent rows late
   else if (ev.ev === 'preview') { S.prev.push(ev); if (S.firstPrev === null) S.firstPrev = ev.t;
-    addTypedLine($('prev'), `[${clock(ev.b)}, ${clock(ev.e)}] (${clock(ev.t)} 出) `, ev.text); }
+    const div = addTypedLine($('feed'), `[${clock(ev.b)}–${clock(ev.e)}] `, ev.text);
+    const ln = { key: ev.b, b: ev.b, e: ev.e, div, stamp: null, solid: null, tail: null, spk: null, auth: false, pv: true };
+    div._ln = ln; S.rows.push(ln); }
   else if (ev.ev === 'stext') { onStext(ev); }
   else if (ev.ev === 'sfinal') { onSfinal(ev); }
   else if (ev.ev === 'final') { S.fin.push(ev); if (S.firstFin === null) S.firstFin = ev.t; S.lats.push(ev.t - ev.e);
-    const c = ev.spk ? color(S.spk, PAL, ev.spk) : '#666';
-    addTypedLine($('final'), `<b style="color:${c}">${esc(ev.spk || '?')}</b> <span>[${clock(ev.b)}–${clock(ev.e)}]</span> `, ev.text, '',
-      ` <span class="lat">+${(ev.t - ev.e).toFixed(1)}s</span>`); }
-  else if (ev.ev === 'end') { au.pause(); if (S.frozen === null) S.frozen = ev.t; }
+    reconcile(ev); }
+  else if (ev.ev === 'end') { au.pause(); if (S.frozen === null) S.frozen = ev.t;
+    settleStream();
+    for (const r of S.rows.slice(-8)) paintLiveStamp(r); }
 }
 const SPAN = 30;  // seconds visible; "now" sits at 85% of the width
 function draw(){
