@@ -516,6 +516,18 @@ struct Segment {
   WallClock::time_point wall_start, wall_end;
 };
 
+// P2c ASR slice pad: a slice boundary that lands inside a word onset leaves
+// the ASR with the tail of the word only (see the comment at the definition
+// site below for the measured impact).  Timestamps keep the unpadded bounds;
+// only the ASR input grows, so labeling and DER scoring are unaffected.
+constexpr std::size_t kAsrPadSamples = kRateOut / 5;  // 0.2 s
+
+// Forward declaration: the streaming preview slices map their concatenated
+// offsets back to source time stamps through the run map (defined below).
+std::size_t ConcatToSource(
+    const std::vector<std::pair<std::size_t, std::size_t>>& runs,
+    std::size_t concat, bool is_end);
+
 class Accumulator {
  public:
   Accumulator(const apm_example::AppConfig& c,
@@ -539,6 +551,8 @@ class Accumulator {
               << "s pause_split=" << (pause_split_ > 0
                   ? std::to_string(pause_split_ / static_cast<double>(kRateOut)) + "s"
                   : std::string("off")) << "\n";
+    // First preview slice fires after the first `preview_` voiced samples.
+    if (preview_ > 0) preview_next_ = static_cast<std::size_t>(preview_);
   }
   void Push(const std::vector<int16_t>& hop, bool voiced) {
     if (voiced) {
@@ -572,12 +586,14 @@ class Accumulator {
       have_voice_ = true;
       in_voice_ = true;
       const size_t total = buffer_.size() + burst_.size();
-      // Streaming fast path: once `preview_` voiced samples have accumulated
-      // (and the segment has not yet hit its max), emit a text-only preview so
-      // the ASR can produce opening words without waiting for the speaker
-      // label.  Emitted once per segment.
-      if (!preview_sent_ && preview_ > 0 &&
-          total >= static_cast<size_t>(preview_) &&
+      // Streaming fast path: every time `preview_` NEW voiced samples have
+      // accumulated past the last emitted preview (and the segment has not
+      // yet hit its max), emit a text-only preview slice so the ASR produces
+      // words continuously at ~preview_seconds granularity, without waiting
+      // for the speaker label (which lands with the normal segment).  The
+      // first slice of a segment starts at its beginning (not at the last
+      // preview end) so openings are not lost.
+      if (preview_ > 0 && total >= preview_next_ &&
           total < static_cast<size_t>(max_)) {
         EmitPreview();
       }
@@ -614,31 +630,49 @@ class Accumulator {
           runs_.clear();
           raw_.clear();
           raw_active_ = false;
-          preview_sent_ = false;
+          preview_done_ = 0; preview_next_ = static_cast<std::size_t>(preview_);
         }
         burst_.clear();
-        // A trailing-silence boundary completes the current utterance.  The
-        // previous implementation only emitted here after max_ samples had
-        // accumulated, so normal utterances shorter than max_segment_seconds
-        // stayed queued indefinitely and never reached the MP3 worker.
+        // A trailing-silence (or pause-split) boundary completes the current
+        // utterance.  The previous implementation only emitted here after
+        // max_ samples had accumulated, so normal utterances shorter than
+        // max_segment_seconds stayed queued indefinitely.
         if (!buffer_.empty()) Emit();
       }
     }
     cursor_ += hop.size();
   }
-  void Flush() { if (burst_.size() >= static_cast<size_t>(min_burst_)) { if (buffer_.empty()) start_ = burst_start_; buffer_.insert(buffer_.end(), burst_.begin(), burst_.end()); } else { runs_.clear(); raw_.clear(); raw_active_ = false; preview_sent_ = false; } if (!buffer_.empty()) Emit(); burst_.clear(); }
+  void Flush() { if (burst_.size() >= static_cast<size_t>(min_burst_)) { if (buffer_.empty()) start_ = burst_start_; buffer_.insert(buffer_.end(), burst_.begin(), burst_.end()); } else { runs_.clear(); raw_.clear(); raw_active_ = false; preview_done_ = 0; preview_next_ = static_cast<std::size_t>(preview_); } if (!buffer_.empty()) Emit(); burst_.clear(); }
  private:
-  // Text-only fast path: emit a short preview of the accumulated voiced audio
-  // so the ASR can produce opening words before the speaker label is known.
+  // Text-only fast path: emit the next slice of the accumulated voiced audio
+  // so the ASR can produce words before the speaker label is known.  Slices
+  // chain through the segment (every preview_ new voiced samples) so fast
+  // text keeps flowing inside long segments instead of stopping after the
+  // opening words.
   void EmitPreview() {
-    preview_sent_ = true;
+    const std::size_t total = buffer_.size() + burst_.size();
+    const std::size_t begin = preview_done_;
+    const std::size_t end = total;
+    preview_done_ = end;
+    preview_next_ = end + static_cast<std::size_t>(preview_);
+    // Chained slices start mid-speech, so pad the ASR input backwards the
+    // same 0.2 s the per-speaker parts use; timestamps stay unpadded.
+    const std::size_t sample_begin =
+        begin > kAsrPadSamples ? begin - kAsrPadSamples : 0;
     Segment p;
     p.is_preview = true;
-    p.start = !runs_.empty() ? runs_.front().second
-                             : (buffer_.empty() ? burst_start_ : start_);
-    p.end = last_voice_;
-    p.samples = buffer_;
-    p.samples.insert(p.samples.end(), burst_.begin(), burst_.end());
+    p.start = ConcatToSource(runs_, begin, false);
+    p.end = ConcatToSource(runs_, end, true);
+    p.samples.reserve(end - sample_begin);
+    if (sample_begin < buffer_.size())
+      p.samples.assign(buffer_.begin() + sample_begin,
+                       buffer_.begin() + std::min(end, buffer_.size()));
+    if (end > buffer_.size()) {
+      const std::size_t from =
+          sample_begin > buffer_.size() ? sample_begin - buffer_.size() : 0;
+      p.samples.insert(p.samples.end(), burst_.begin() + from,
+                       burst_.begin() + (end - buffer_.size()));
+    }
     p.wall_start = start_wall_ + std::chrono::milliseconds(
         static_cast<int64_t>(p.start) * 1000 / kRateOut);
     p.wall_end = start_wall_ + std::chrono::milliseconds(
@@ -674,9 +708,9 @@ class Accumulator {
     // the next voiced hop establish a fresh start offset and end timestamp.
     in_voice_ = false;
     have_voice_ = false;
-    preview_sent_ = false;
+    preview_done_ = 0; preview_next_ = static_cast<std::size_t>(preview_);
   }
-  int min_burst_, min_segment_, max_, trailing_, preview_, pause_split_, pause_len_; std::function<void(Segment)> submit_; WallClock::time_point start_wall_; std::vector<int16_t> buffer_, burst_; std::vector<std::size_t> join_points_; std::vector<std::pair<std::size_t, std::size_t>> runs_; std::vector<int16_t> raw_; std::size_t raw_start_ = 0; bool raw_active_ = false; size_t start_ = 0, burst_start_ = 0, cursor_ = 0, last_voice_ = 0; bool in_voice_ = false, have_voice_ = false, preview_sent_ = false;
+  int min_burst_, min_segment_, max_, trailing_, preview_, pause_split_, pause_len_; std::function<void(Segment)> submit_; WallClock::time_point start_wall_; std::vector<int16_t> buffer_, burst_; std::vector<std::size_t> join_points_; std::vector<std::pair<std::size_t, std::size_t>> runs_; std::vector<int16_t> raw_; std::size_t raw_start_ = 0; bool raw_active_ = false; size_t start_ = 0, burst_start_ = 0, cursor_ = 0, last_voice_ = 0; bool in_voice_ = false, have_voice_ = false; std::size_t preview_done_ = 0, preview_next_ = 0;
 };
 
 bool WriteWav(const fs::path& path, const std::vector<int16_t>& samples, int rate) {
@@ -740,6 +774,7 @@ constexpr std::size_t kMinPartSamples = kRateOut * 3 / 10;  // 0.3 s
 
 // Concatenated (voiced-only) offset -> absolute source offset via `runs`.
 // `is_end` maps an exclusive end so it never jumps into the next run.
+
 std::size_t ConcatToSource(
     const std::vector<std::pair<std::size_t, std::size_t>>& runs,
     std::size_t concat, bool is_end) {
@@ -749,19 +784,6 @@ std::size_t ConcatToSource(
   while (r + 1 < runs.size() && runs[r + 1].first <= probe) ++r;
   return runs[r].second + (probe - runs[r].first) + ((is_end && concat > 0) ? 1 : 0);
 }
-
-// P2c ASR slice pad: a part boundary that lands inside a word onset leaves the
-// ASR with the tail of the word only.  In the 2P run the second turn was cut
-// at source 2.080 s, about 20 ms into the "可" burst (rms 823 at 2.06 s), and
-// the whole "可以听到。" came back as "以。" (run-pad-experiment.sh).  Replaying
-// every recorded part of the run with and without the pad (run-pad-replay.sh)
-// changes 47 of 236 part texts, including that one ("以。" -> "可以听。"); the
-// net character gain over the session is small (~11 chars on 5.6k), so this
-// fixes the visible headless-word cases rather than the bulk of the
-// dropped-character volume.  Timestamps, parts.txt and the RTTM keep the
-// unpadded bounds — only the ASR input grows, so labeling and DER scoring are
-// unaffected.
-constexpr std::size_t kAsrPadSamples = kRateOut / 5;  // 0.2 s
 
 // Largest concatenated prefix whose source samples are already covered by the
 // time line frontier (source samples with final speaker labels).
@@ -2512,8 +2534,8 @@ class ResultWorker {
           const std::string text = asr_.Transcribe(preview_wav);
           if (!streaming_text_file_.empty()) {
             std::ofstream stxt(streaming_text_file_, std::ios::app);
-            stxt << "pending@" << SpeakerTimeStamp(s.wall_start) << " "
-                 << text << "\n";
+            stxt << "pending@[" << EventLog::Sec(s.start, kRateOut) << ","
+                 << EventLog::Sec(s.end, kRateOut) << "] " << text << "\n";
           }
           std::cerr << "[asr] preview text: " << text << "\n";
           EventLog::Get().Write("preview",

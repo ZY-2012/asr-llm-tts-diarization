@@ -34,12 +34,13 @@ REF_RTTM = os.path.join(REPO, "build/3dspk/out/label-2P-v8-recheck.rttm")
 STEPS = ["10", "2", "1"]
 MAXSEGS = ["10", "5"]
 PSPLITS = ["0", "4", "3"]
+PREVIEWS = ["0", "3", "2", "1"]
 
 state = {"proc": None, "input": None, "launched": 0.0}
 lock = threading.Lock()
 
 
-def make_config(wav, step, maxseg, psplit):
+def make_config(wav, step, maxseg, psplit, preview):
     text = open(TEMPLATE, encoding="utf-8").read()
     text = text.replace("/tmp/der-2pw-inc-preview3", WORK)
     text = re.sub(r"mp3_dir: .*", "mp3_dir: %s/mp3" % WORK, text)
@@ -47,6 +48,7 @@ def make_config(wav, step, maxseg, psplit):
     text = re.sub(r"session_step_sec: .*", "session_step_sec: %s" % step, text)
     text = re.sub(r"max_segment_seconds: .*", "max_segment_seconds: %s" % maxseg, text)
     text = re.sub(r"pause_split_seconds: .*", "pause_split_seconds: %s" % psplit, text)
+    text = re.sub(r"preview_seconds: .*", "preview_seconds: %s" % preview, text)
     path = os.path.join(WORK, "config.yaml")
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
@@ -69,18 +71,18 @@ def running():
     return p is not None and p.poll() is None
 
 
-def start(key, step, maxseg, psplit):
+def start(key, step, maxseg, psplit, preview):
     with lock:
         if running():
             return False, "already running"
         wav = INPUTS.get(key)
         if not wav or not os.path.isfile(wav):
             return False, "missing input %s" % wav
-        if step not in STEPS or maxseg not in MAXSEGS or psplit not in PSPLITS:
-            return False, "bad step/maxseg/psplit"
+        if step not in STEPS or maxseg not in MAXSEGS or psplit not in PSPLITS or preview not in PREVIEWS:
+            return False, "bad step/maxseg/psplit/preview"
         subprocess.run(["rm", "-rf", WORK])
         os.makedirs(os.path.join(WORK, "mp3"), exist_ok=True)
-        cfg = make_config(wav, step, maxseg, psplit)
+        cfg = make_config(wav, step, maxseg, psplit, preview)
         log = open(LOG, "w")
         state["proc"] = subprocess.Popen(
             [os.path.join(REPO, "build/audio-pipeline"), "--config", cfg],
@@ -155,7 +157,8 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         if u.path == "/start":
             ok, msg = start(q.get("input", ["60"])[0], q.get("step", ["2"])[0],
-                            q.get("maxseg", ["5"])[0], q.get("psplit", ["4"])[0])
+                            q.get("maxseg", ["5"])[0], q.get("psplit", ["4"])[0],
+                            q.get("preview", ["2"])[0])
             self.send_json({"ok": ok, "msg": msg}, 200 if ok else 409)
         elif u.path == "/stop":
             ok, msg = stop()
