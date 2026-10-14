@@ -136,12 +136,31 @@ function streamLine(el, b){
   const tail = document.createElement('span'); tail.className = 'stail';
   div.appendChild(stamp); div.appendChild(solid); div.appendChild(tail);
   el.appendChild(div);
-  return { key: b, div, solid, tail };
+  const ln = { key: b, b: b, e: null, div, stamp, solid, tail, spk: null };
+  div._ln = ln;
+  return ln;
 }
 function settleStream(){
   if (!S.st) return;
   S.st.tail.textContent = '';
+  if (S.st.e === null) S.st.e = now();
   S.st = null;
+}
+// Late speaker back-fill: diar coverage may pass an epoch after it finalized
+// (the label commit lags the text). Walk settled lines once per diar event.
+function backfillSpeakers(){
+  const el = $('prev');
+  for (const div of el.children) {
+    const ln = div._ln;
+    if (!ln || ln.spk || ln.e === undefined || ln.e <= ln.b) continue;
+    let best = null, bestLen = 0;
+    for (const d of S.diar) {
+      const o = Math.min(ln.e, d.e) - Math.max(ln.b, d.b);
+      if (o > bestLen) { bestLen = o; best = d.spk; }
+    }
+    if (best) { ln.spk = best; const c = color(S.spk, PAL, best);
+      div._ln.stamp.innerHTML = '<b style="color:' + c + '">' + esc(best) + '</b> [' + clock(ln.b) + '] '; }
+  }
 }
 function onStext(ev){
   const el = $('prev');
@@ -155,9 +174,22 @@ function onSfinal(ev){
   const el = $('prev');
   if (!S.st || S.st.key !== ev.b) { settleStream(); S.st = streamLine(el, ev.b); }
   if (S.firstStext === null) S.firstStext = ev.t;
+  // Speaker post-labeling: overlap the epoch with the diar timeline; the
+  // speaker owning most of the interval wins (labels arrive later than the
+  // text by design - P3 back-fill).
+  let best = null, bestLen = 0;
+  for (const d of S.diar) {
+    const o = Math.min(ev.e, d.e) - Math.max(ev.b, d.b);
+    if (o > bestLen) { bestLen = o; best = d.spk; }
+  }
+  if (best) { const c = color(S.spk, PAL, best);
+    S.st.stamp.innerHTML = '<b style="color:' + c + '">' + esc(best) + '</b> [' + clock(ev.b) + '] '; }
+  S.st.e = ev.e;
+  S.st.spk = best;
   S.st.solid.textContent = ev.text;
   S.st.tail.textContent = '';
   settleStream();
+  backfillSpeakers();
   S.prev.push({ b: ev.b, e: ev.e });   // epoch bar on the timeline text row
   if (el.scrollTop + el.clientHeight >= el.scrollHeight - 26) el.scrollTop = el.scrollHeight;
 }
@@ -171,7 +203,7 @@ function onEvent(ev){
   if (S.t0 === null) return;
   // SSE is polled every 0.1 s: never let the page clock lag the board clock.
   if (S.frozen === null && ev.t > now()) S.t0 = performance.now() - ev.t * 1000;
-  if (ev.ev === 'diar') { S.diar.push(...ev.parts.map(p => ({b:p[0], e:p[1], spk:p[2], t:ev.t}))); S.cov = Math.max(S.cov, ev.core[1]); }
+  if (ev.ev === 'diar') { S.diar.push(...ev.parts.map(p => ({b:p[0], e:p[1], spk:p[2], t:ev.t}))); S.cov = Math.max(S.cov, ev.core[1]); backfillSpeakers(); }
   else if (ev.ev === 'preview') { S.prev.push(ev); if (S.firstPrev === null) S.firstPrev = ev.t;
     addTypedLine($('prev'), `[${clock(ev.b)}, ${clock(ev.e)}] (${clock(ev.t)} 出) `, ev.text); }
   else if (ev.ev === 'stext') { onStext(ev); }
