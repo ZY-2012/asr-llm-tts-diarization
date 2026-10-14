@@ -234,10 +234,26 @@ partition 边界断裂的口径假象；聚类质量本身与 oneshot 等价（r
 聚类上下文是跨请求的 `inc_fc_/inc_rc_` 状态，非重聚窗）。落地配置即
 `session_chunk_sec == session_step_sec == 10`（`config-2pw-inc.yaml`），现有
 `SessionDiarizer` 的滑窗提交在 chunk==step 时自然退化为逐 10s 非重叠子窗，无需改框架循环。
-板端 2P 全程实测：**首标签 wall=+10.22s**（10s 缓冲 + 0.24s 推理，vs 132.3s 提前 ~13 倍），
-第 1 子窗即发现 2 人（speaker-1/speaker-2），稳态每 10s 窗推理 221~242ms
-（rtf≈0.023，标签延迟 ~0.2s）。多说话人场景可开 `--incremental-plda`（delta_new 0.55
-三场景统一），或探索自适应 delta_new。
+板端 2P 全程实测（`config-2pw-inc.yaml`，mode=session chunk=step=10，196 子窗）：
+**首标签 wall=+10.22s**（10s 缓冲 + 0.24s 推理，vs 132.3s 提前 ~13 倍），第 1 子窗即
+发现 2 人（speaker-1/speaker-2），稳态每 10s 窗推理 221~242ms（rtf≈0.023，标签延迟
+~0.2s，推理占空比 44s/1956s=2.3%）。RTTM 口径 DER（vs v8-recheck，collar 0.25）：
+
+| 运行 | miss | fa | conf | DER |
+| --- | --- | --- | --- | --- |
+| online-vad30（批处理 120s 基线） | 14.56% | 11.00% | 3.07% | 28.64% |
+| online-step10（120s/step10 滑窗） | 24.01% | 2.70% | 2.54% | 29.25% |
+| **inc（增量聚类 10s 子窗）** | **14.56%** | **11.00%** | **1.42%** | **26.99%** |
+
+- conf 3.07%→**1.42%**（相对降 ~54%）、DER 28.64%→**26.99%**（三者最优）；miss/fa 与
+  baseline 相同（VAD 0.3 覆盖不变，只换了聚类层）。
+- 距 oneshot 0.39% 仍有 ~1pp 差：流式逐 10s 子窗每窗独立 segmentation/partition，
+  边界断裂导致的短促说话人切换（summary 前文已定性为口径假象，聚类质量等价 oneshot）。
+- 产物：`/tmp/der-2pw-inc/ali/transcript.txt`（220 行 speaker+文本）、
+  `build/3dspk/out/label-2P-inc.txt`（源时间 transcript）、`rttm-2p-inc/`（RTTM）。
+
+多说话人场景可开 `--incremental-plda`（delta_new 0.55 三场景统一），或探索自适应
+delta_new；边界断裂可用子窗重叠 / 跨边界平滑进一步收窄（可选下一步）。
 
 ## 3. 已完成的工作
 
