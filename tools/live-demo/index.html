@@ -192,8 +192,7 @@ function renderAuthRow(r){
     const line = document.createElement('div'); line.className = 'ln';
     line.innerHTML = '<span class="tm"><b style="color:' + c + '">' + esc(f.spk || '?') +
       '</b> <span>[' + clock(f.b) + '–' + clock(f.e) + ']</span> </span>' +
-      '<span class="ssolid" style="color:' + c + '">' + esc(f.text) + '</span>' +
-      '<span class="lat"> +' + (f.t - f.e).toFixed(1) + 's</span>';
+      '<span class="ssolid" style="color:' + c + '">' + esc(f.text) + '</span>';
     r.div.appendChild(line);
   }
   feedStick();

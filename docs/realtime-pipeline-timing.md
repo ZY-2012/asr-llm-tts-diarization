@@ -240,7 +240,7 @@ pipeline 新增的 `events.jsonl`（start/diar/stext/sfinal/final/end，含
   speaker-2 的「可以听到」被贴成 speaker-1）。
 - finals 到达后**原地对账**：每条 final 唯一归属重叠最大的行（echo-free，
   绝不跨行重复），归属行在其原位展开为**每 final 一行**的权威稿
-  （`说话人 [b–e] 文字 +滞后s`，与 transcript 同格式）——跨说话人纪元
+  （`说话人 [b–e] 文字`，行级滞后不显示、延迟看顶部统计栏）——跨说话人纪元
   自然拆成多行分色（上例对账后即 speaker-2「可以听到。」独立一行 +
   speaker-1 后续各一行）。33min 实测：482 finals 中 481 条唯一归属、
   仅 1 条独立插入；170/173 条未获归属的行因区间已被别行 finals 完整
