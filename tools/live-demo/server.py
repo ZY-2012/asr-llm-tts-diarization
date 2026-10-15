@@ -23,12 +23,15 @@ from urllib.parse import urlparse, parse_qs
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE = os.path.join(REPO, "build/der-eval/config-2pw-inc-preview3.yaml")
-WORK = "/tmp/rt-demo"
+# Run workspace and inputs live on the NFS share (board<->host), never /tmp:
+# intermediates must survive board swaps and be visible from both sides.
+ROOT = os.path.abspath(os.path.join(REPO, ".."))   # ASR-LLM-TTS-Pipeline/
+WORK = os.path.join(ROOT, "rt-demo")
 EVENTS = os.path.join(WORK, "ali/events.jsonl")
 LOG = os.path.join(WORK, "run.log")
 INPUTS = {
-    "60": "/tmp/3dspk/2P_60s.16k.wav",
-    "full": "/tmp/3dspk/20200327_2P.16k.wav",
+    "60": os.path.join(ROOT, "scratch/2P_60s.16k.wav"),
+    "full": os.path.join(ROOT, "scratch/20200327_2P.16k.wav"),
 }
 REF_RTTM = os.path.join(REPO, "build/3dspk/out/label-2P-v8-recheck.rttm")
 STEPS = ["10", "2", "1"]
@@ -45,7 +48,10 @@ lock = threading.Lock()
 def make_config(wav, step, maxseg, psplit, preview, trail, tick):
     text = open(TEMPLATE, encoding="utf-8").read()
     text = text.replace("/tmp/der-2pw-inc-preview3", WORK)
+    text = text.replace("/tmp/ax-audio-sdk-npu2.lock", os.path.join(WORK, "npu2.lock"))
+    text = text.replace("/tmp/ax-audio-sdk", os.path.join(WORK, "sdk"))
     text = re.sub(r"mp3_dir: .*", "mp3_dir: %s/mp3" % WORK, text)
+    text = re.sub(r"model_path: .*", "model_path: models-for-asr-chain/pyannote", text)
     text = re.sub(r"input_wav: .*", "input_wav: %s" % wav, text)
     text = re.sub(r"session_step_sec: .*", "session_step_sec: %s" % step, text)
     text = re.sub(r"max_segment_seconds: .*", "max_segment_seconds: %s" % maxseg, text)
